@@ -1,38 +1,114 @@
-/**
- * Welcome to Cloudflare Workers!
- *
- * This is a template for a Queue consumer: a Worker that can consume from a
- * Queue: https://developers.cloudflare.com/queues/get-started/
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
+import dinkConfigTemplate from "../dinkconfig-template.json";
+
+const CHANNEL_TO_SECRET = {
+	achievements: "WEBHOOK_ACHIEVEMENTS",
+	deaths: "WEBHOOK_DEATHS",
+	collection: "WEBHOOK_COLLECTION",
+};
+
+const SAFE_ALLOWED_MENTIONS = { parse: [] };
+
+const CONFIG_TEMPLATE_STRING = JSON.stringify(dinkConfigTemplate);
+
+function getValidTokens(env) {
+	return new Set(
+		(env.VALID_TOKENS || "")
+			.split(",")
+			.map((t) => t.trim())
+			.filter(Boolean),
+	);
+}
+
+async function handleHook(request, env, channel) {
+	const secretName = CHANNEL_TO_SECRET[channel];
+	const webhook = secretName && env[secretName];
+	if (!webhook) {
+		return new Response("unknown channel", { status: 404 });
+	}
+
+	const contentType = request.headers.get("Content-Type") || "";
+	let upstream;
+
+	if (contentType.includes("application/json")) {
+		let payload;
+		try {
+			payload = await request.json();
+		} catch {
+			return new Response("invalid json", { status: 400 });
+		}
+		payload.allowed_mentions = SAFE_ALLOWED_MENTIONS;
+		upstream = await fetch(webhook, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(payload),
+		});
+	} else if (contentType.includes("multipart/form-data")) {
+		let form;
+		try {
+			form = await request.formData();
+		} catch {
+			return new Response("invalid multipart", { status: 400 });
+		}
+		const payloadJsonRaw = form.get("payload_json");
+		if (typeof payloadJsonRaw !== "string") {
+			return new Response("missing payload_json", { status: 400 });
+		}
+		let payload;
+		try {
+			payload = JSON.parse(payloadJsonRaw);
+		} catch {
+			return new Response("invalid payload_json", { status: 400 });
+		}
+		payload.allowed_mentions = SAFE_ALLOWED_MENTIONS;
+		form.set("payload_json", JSON.stringify(payload));
+		upstream = await fetch(webhook, { method: "POST", body: form });
+	} else {
+		return new Response("unsupported content type", { status: 415 });
+	}
+
+	return new Response(upstream.body, { status: upstream.status });
+}
+
+function handleConfig(token) {
+	const body = CONFIG_TEMPLATE_STRING.replaceAll("{{TOKEN}}", token);
+	return new Response(body, {
+		headers: {
+			"Content-Type": "application/json",
+			"Cache-Control": "no-store",
+		},
+	});
+}
 
 export default {
-	// Our fetch handler is invoked on a HTTP request: we can send a message to a queue
-	// during (or after) a request.
-	// https://developers.cloudflare.com/queues/platform/javascript-apis/#producer
-	async fetch(req, env, ctx) {
-		// To send a message on a queue, we need to create the queue first
-		// https://developers.cloudflare.com/queues/get-started/#3-create-a-queue
-		await env.MY_QUEUE.send({
-			url: req.url,
-			method: req.method,
-			headers: Object.fromEntries(req.headers),
-		});
-		return new Response('Sent message to the queue');
-	},
-	// The queue handler is invoked when a batch of messages is ready to be delivered
-	// https://developers.cloudflare.com/queues/platform/javascript-apis/#messagebatch
-	async queue(batch, env) {
-		// A queue consumer can make requests to other endpoints on the Internet,
-		// write to R2 object storage, query a D1 Database, and much more.
-		for (let message of batch.messages) {
-			// Process each message (we'll just log these)
-			console.log(`message ${message.id} processed: ${JSON.stringify(message.body)}`);
+	async fetch(request, env) {
+		const url = new URL(request.url);
+		const parts = url.pathname.split("/").filter(Boolean);
+		const validTokens = getValidTokens(env);
+
+		if (
+			request.method === "GET" &&
+			parts.length === 2 &&
+			parts[0] === "config"
+		) {
+			const [, token] = parts;
+			if (!validTokens.has(token)) {
+				return new Response("unauthorized", { status: 401 });
+			}
+			return handleConfig(token);
 		}
+
+		if (
+			request.method === "POST" &&
+			parts.length === 3 &&
+			parts[0] === "hook"
+		) {
+			const [, token, channel] = parts;
+			if (!validTokens.has(token)) {
+				return new Response("unauthorized", { status: 401 });
+			}
+			return handleHook(request, env, channel);
+		}
+
+		return new Response("not found", { status: 404 });
 	},
 };
