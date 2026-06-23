@@ -19,6 +19,45 @@ function getValidTokens(env) {
 	);
 }
 
+// ── Per-user Dink tokens ─────────────────────────────────────────────────────
+// Personal config tokens are minted (and revoked/rotated) in the dink_tokens
+// table by both the Discord bot (/dink, /dink-revoke) and the site. The proxy
+// validates an incoming token against the union of:
+//   1. the active (revoked_at IS NULL) rows in dink_tokens (Supabase), and
+//   2. the legacy VALID_TOKENS secret (kept as a fallback / for the bot's syncWorker).
+// The Supabase set is cached in an isolate global with a short TTL so a freshly
+// minted or revoked token takes effect within ~TTL without a redeploy.
+let tokensCache = { at: 0, set: null };
+
+async function fetchDinkTokens(env) {
+	const url = `${env.SUPABASE_URL}/rest/v1/dink_tokens?select=token&revoked_at=is.null`;
+	const res = await fetch(url, {
+		headers: {
+			apikey: env.SUPABASE_KEY,
+			Authorization: `Bearer ${env.SUPABASE_KEY}`,
+		},
+	});
+	if (!res.ok) throw new Error(`dink_tokens ${res.status}`);
+	const rows = await res.json();
+	return (rows || []).map((r) => r.token).filter(Boolean);
+}
+
+async function getValidTokenSet(env) {
+	const set = getValidTokens(env); // legacy VALID_TOKENS secret (fresh Set each call)
+	if (!supabaseConfigured(env)) return set;
+	const ttl = Number(env.TOKENS_TTL_MS) || 30000;
+	if (!tokensCache.set || Date.now() - tokensCache.at >= ttl) {
+		try {
+			tokensCache = { at: Date.now(), set: new Set(await fetchDinkTokens(env)) };
+		} catch (e) {
+			console.warn("[tokens] load failed:", e.message);
+			if (!tokensCache.set) tokensCache = { at: Date.now(), set: new Set() };
+		}
+	}
+	for (const t of tokensCache.set) set.add(t);
+	return set;
+}
+
 // ── Active Event Manifest (cached in the isolate global) ─────────────────────
 // The site (Supabase) is the source of truth. We read two views: the participant
 // RSN set (clan ∪ open-event signups) and the tracked-item set for open events.
@@ -237,7 +276,7 @@ export default {
 	async fetch(request, env, ctx) {
 		const url = new URL(request.url);
 		const parts = url.pathname.split("/").filter(Boolean);
-		const validTokens = getValidTokens(env);
+		const validTokens = await getValidTokenSet(env);
 
 		if (
 			request.method === "GET" &&

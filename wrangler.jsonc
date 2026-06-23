@@ -22,6 +22,10 @@
 		// disable auto-tracking (the proxy then behaves exactly as before).
 		"SUPABASE_URL": "",
 		// Manifest cache TTL (ms) in the isolate global.
-		"MANIFEST_TTL_MS": "30000"
+		"MANIFEST_TTL_MS": "30000",
+		// Per-user token cache TTL (ms). Tokens are minted/revoked in the dink_tokens
+		// table by the bot and the site; the proxy validates against that set (unioned
+		// with VALID_TOKENS) and a mint/revoke takes effect within this TTL.
+		"TOKENS_TTL_MS": "30000"
 	}
 }
