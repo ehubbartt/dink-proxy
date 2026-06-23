@@ -102,7 +102,9 @@ async function ingestLootMatches(env, payload, manifest) {
 		const itemNameLc = String(item.name || "").toLowerCase();
 		const match =
 			byId ||
-			(itemNameLc ? manifest.items.find((t) => t.item_name === itemNameLc) : undefined);
+			(itemNameLc
+				? manifest.items.find((t) => String(t.item_name || "").toLowerCase() === itemNameLc)
+				: undefined);
 		if (!match) continue;
 		// Optional source restriction on the tracked item.
 		if (match.source_name && String(source || "").toLowerCase() !== match.source_name.toLowerCase()) {
@@ -191,9 +193,11 @@ async function handleHook(request, env, ctx, channel) {
 	payload.allowed_mentions = SAFE_ALLOWED_MENTIONS;
 
 	// ── LOOT: auto-tracking + Discord feed policy ────────────────────────────
-	// Because minLootValue is lowered, the proxy now sees every drop. We make two
+	// Active events' tracked items are injected into Dink's loot allowlist (see
+	// handleConfig), so the proxy receives them regardless of value. We make two
 	// independent decisions: (B) record matched drops for the bingo tracker, and
-	// (A) only forward to Discord when the drop clears FEED_MIN_VALUE.
+	// (A) only forward to Discord when the drop clears FEED_MIN_VALUE (so cheap
+	// tracked items are recorded but don't spam the achievements channel).
 	if (payload.type === "LOOT") {
 		const manifest = await getManifest(env);
 		// Decision B — ack Dink fast; do the DB write in the background.
@@ -223,8 +227,49 @@ async function handleHook(request, env, ctx, channel) {
 	return new Response(upstream.body, { status: upstream.status });
 }
 
-function handleConfig(token, templateString) {
-	const body = templateString.replaceAll("{{TOKEN}}", token);
+// Serve the Dink config for a token: inject the active events' tracked-item names
+// into Dink's loot allowlist (so the proxy receives those items regardless of value,
+// without lowering minLootValue to 1) and guarantee a sane minLootValue. {{TOKEN}}
+// is substituted last.
+async function handleConfig(env, token) {
+	const templateString = await getConfigTemplate(env);
+	let cfg;
+	try {
+		cfg = JSON.parse(templateString);
+	} catch {
+		cfg = {};
+	}
+
+	// Merge active tracked-item names into lootItemAllowlist (newline-separated).
+	try {
+		const manifest = await getManifest(env);
+		const names = [
+			...new Set(manifest.items.map((i) => (i.item_name || "").trim()).filter(Boolean)),
+		];
+		if (names.length) {
+			const base =
+				typeof cfg.lootItemAllowlist === "string" && cfg.lootItemAllowlist.trim()
+					? cfg.lootItemAllowlist.split("\n").map((s) => s.trim()).filter(Boolean)
+					: [];
+			// Dedupe case-insensitively, preserving the first spelling seen.
+			const seen = new Set(base.map((s) => s.toLowerCase()));
+			const merged = [...base];
+			for (const n of names) {
+				if (!seen.has(n.toLowerCase())) {
+					seen.add(n.toLowerCase());
+					merged.push(n);
+				}
+			}
+			cfg.lootItemAllowlist = merged.join("\n");
+		}
+	} catch (e) {
+		console.warn("[config] allowlist injection failed:", e.message);
+	}
+
+	// Guarantee a value threshold (the allowlist covers tracked items separately).
+	if (cfg.minLootValue == null) cfg.minLootValue = 3000000;
+
+	const body = JSON.stringify(cfg).replaceAll("{{TOKEN}}", token);
 	return new Response(body, {
 		headers: {
 			"Content-Type": "application/json",
@@ -287,7 +332,7 @@ export default {
 			if (!validTokens.has(token)) {
 				return new Response("unauthorized", { status: 401 });
 			}
-			return handleConfig(token, await getConfigTemplate(env));
+			return handleConfig(env, token);
 		}
 
 		if (

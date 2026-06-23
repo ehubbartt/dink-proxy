@@ -120,7 +120,7 @@
   "deathNotifPvpMessage": "%USERNAME% has just been PKed by %PKER% for %VALUELOST% gp...",
   "groupStorageEnabled": false,
   "diaryMessage": "%USERNAME% has completed the %DIFFICULTY% %AREA% Achievement Diary, for a total of %TOTAL% diaries completed",
-  "minLootValue": 1,
+  "minLootValue": 3000000,
   "pkMinValue": 0,
   "notifyGrandExchange": false,
   "grandExchangeNotifyMessage": "%USERNAME% %TYPE% %ITEM% on the GE",
