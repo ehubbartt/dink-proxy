@@ -22,6 +22,11 @@
 		// disable auto-tracking (the proxy then behaves exactly as before).
 		"SUPABASE_URL": "",
 		// Manifest cache TTL (ms) in the isolate global.
-		"MANIFEST_TTL_MS": "30000"
+		"MANIFEST_TTL_MS": "30000",
+		// Dink config template cache TTL (ms). The template is admin-editable on the
+		// site (bot_config row 'dink_config'); served here with the bundled JSON as
+		// fallback. Clients re-fetch /config periodically, so edits propagate within
+		// this TTL + the client's refetch interval — no redeploy needed.
+		"CONFIG_TTL_MS": "60000"
 	}
 }

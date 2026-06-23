@@ -223,14 +223,53 @@ async function handleHook(request, env, ctx, channel) {
 	return new Response(upstream.body, { status: upstream.status });
 }
 
-function handleConfig(token) {
-	const body = CONFIG_TEMPLATE_STRING.replaceAll("{{TOKEN}}", token);
+function handleConfig(token, templateString) {
+	const body = templateString.replaceAll("{{TOKEN}}", token);
 	return new Response(body, {
 		headers: {
 			"Content-Type": "application/json",
 			"Cache-Control": "no-store",
 		},
 	});
+}
+
+// ── Dink config template (admin-editable via the site) ───────────────────────
+// The config is editable on the site as a bot_config row (config_name=dink_config)
+// and served live here, so admins can change Dink settings without a redeploy.
+// Cached in an isolate global with a TTL; falls back to the bundled template when
+// Supabase is unconfigured or the row is absent (so default behaviour is preserved).
+let configCache = { at: 0, data: null };
+
+async function fetchConfigTemplate(env) {
+	const url = `${env.SUPABASE_URL}/rest/v1/bot_config?select=config_value&config_name=eq.dink_config&limit=1`;
+	const res = await fetch(url, {
+		headers: {
+			apikey: env.SUPABASE_KEY,
+			Authorization: `Bearer ${env.SUPABASE_KEY}`,
+		},
+	});
+	if (!res.ok) throw new Error(`bot_config ${res.status}`);
+	const rows = await res.json();
+	const value = rows?.[0]?.config_value;
+	return value ? JSON.stringify(value) : null;
+}
+
+async function getConfigTemplate(env) {
+	if (!supabaseConfigured(env)) return CONFIG_TEMPLATE_STRING;
+	const ttl = Number(env.CONFIG_TTL_MS) || 60000;
+	if (configCache.data && Date.now() - configCache.at < ttl) {
+		return configCache.data;
+	}
+	try {
+		const tmpl = await fetchConfigTemplate(env);
+		const data = tmpl || CONFIG_TEMPLATE_STRING; // missing row → bundled fallback
+		configCache = { at: Date.now(), data };
+		return data;
+	} catch (e) {
+		console.warn("[config] load failed (using bundled):", e.message);
+		// Serve the last good value if we have one, else the bundled template.
+		return configCache.data || CONFIG_TEMPLATE_STRING;
+	}
 }
 
 export default {
@@ -248,7 +287,7 @@ export default {
 			if (!validTokens.has(token)) {
 				return new Response("unauthorized", { status: 401 });
 			}
-			return handleConfig(token);
+			return handleConfig(token, await getConfigTemplate(env));
 		}
 
 		if (
