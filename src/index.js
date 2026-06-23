@@ -96,7 +96,7 @@ async function getManifest(env) {
 			sbGet(
 				env,
 				"vs_active_tracked_items",
-				"event_id,tile_id,item_id,item_name,required_qty,source_name",
+				"event_id,tile_id,item_id,item_name,required_qty,source_name,match_type",
 			),
 		]);
 		const data = {
@@ -121,47 +121,28 @@ async function dropKey(parts) {
 	return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Decision B: for a LOOT payload, record any item that belongs to an active
-// tracked-item set AND was dropped by a known participant. Writes to vs_dink_drops
-// (dedup via drop_key). Best-effort: failures are logged, never thrown.
-async function ingestLootMatches(env, payload, manifest) {
-	if (!supabaseConfigured(env)) return;
-	const rsn = String(payload.playerName || "");
-	if (!rsn || !manifest.participants.has(rsn.toLowerCase())) return;
-
-	const items = payload?.extra?.items;
-	if (!Array.isArray(items) || items.length === 0) return;
-
-	const source = payload?.extra?.source ?? null;
-	const dinkTs = payload?.embeds?.[0]?.timestamp ?? new Date().toISOString();
-
-	const rows = [];
-	for (const item of items) {
-		const byId = item.id != null ? manifest.items.find((t) => t.item_id === item.id) : undefined;
-		const itemNameLc = String(item.name || "").toLowerCase();
-		const match =
-			byId ||
-			(itemNameLc ? manifest.items.find((t) => t.item_name === itemNameLc) : undefined);
-		if (!match) continue;
-		// Optional source restriction on the tracked item.
-		if (match.source_name && String(source || "").toLowerCase() !== match.source_name.toLowerCase()) {
-			continue;
-		}
-		const qty = Number(item.quantity) || 1;
-		const key = await dropKey([rsn, item.id ?? item.name, source ?? "", dinkTs, qty]);
-		rows.push({
-			event_id: match.event_id,
-			rsn,
-			item_id: item.id ?? null,
-			item_name: item.name ?? null,
-			quantity: qty,
-			source,
-			dink_ts: dinkTs,
-			drop_key: key,
-		});
+// Find an active tracked item matching this {id, name, source} for the given match
+// type ('loot' | 'collection'). Id match preferred, case-insensitive name fallback.
+// match_type defaults to 'loot' for rows predating the column.
+function findTrackedMatch(manifest, { id, name, source }, matchType) {
+	const nameLc = String(name || "").toLowerCase();
+	const candidates = manifest.items.filter((t) => (t.match_type || "loot") === matchType);
+	const byId = id != null ? candidates.find((t) => t.item_id === id) : undefined;
+	const match =
+		byId ||
+		(nameLc ? candidates.find((t) => String(t.item_name || "").toLowerCase() === nameLc) : undefined);
+	if (!match) return null;
+	// Optional source restriction on the tracked item (loot only, in practice).
+	if (match.source_name && String(source || "").toLowerCase() !== match.source_name.toLowerCase()) {
+		return null;
 	}
-	if (rows.length === 0) return;
+	return match;
+}
 
+// Insert matched drop rows into vs_dink_drops (dedup via drop_key). Best-effort:
+// failures are logged, never thrown.
+async function insertDinkDrops(env, rows) {
+	if (rows.length === 0) return;
 	try {
 		const res = await fetch(
 			`${env.SUPABASE_URL}/rest/v1/vs_dink_drops?on_conflict=drop_key`,
@@ -182,6 +163,77 @@ async function ingestLootMatches(env, payload, manifest) {
 	} catch (e) {
 		console.warn("[ingest] insert error:", e.message);
 	}
+}
+
+// Decision B (LOOT): record any looted item that belongs to an active loot-type
+// tracked-item set AND was dropped by a known participant.
+async function ingestLootMatches(env, payload, manifest) {
+	if (!supabaseConfigured(env)) return;
+	const rsn = String(payload.playerName || "");
+	if (!rsn || !manifest.participants.has(rsn.toLowerCase())) return;
+
+	const items = payload?.extra?.items;
+	if (!Array.isArray(items) || items.length === 0) return;
+
+	const source = payload?.extra?.source ?? null;
+	const dinkTs = payload?.embeds?.[0]?.timestamp ?? new Date().toISOString();
+
+	const rows = [];
+	for (const item of items) {
+		const match = findTrackedMatch(manifest, { id: item.id, name: item.name, source }, "loot");
+		if (!match) continue;
+		const qty = Number(item.quantity) || 1;
+		const value = (Number(item.priceEach) || 0) * qty;
+		const key = await dropKey([rsn, item.id ?? item.name, source ?? "", dinkTs, qty]);
+		rows.push({
+			event_id: match.event_id,
+			rsn,
+			item_id: item.id ?? null,
+			item_name: item.name ?? null,
+			quantity: qty,
+			source,
+			value,
+			dink_ts: dinkTs,
+			drop_key: key,
+			notif_type: "loot",
+		});
+	}
+	await insertDinkDrops(env, rows);
+}
+
+// Decision B (COLLECTION): a collection-log unlock (also how pets register, since a
+// pet is a clog slot). Matches collection-type tracked items by the unlocked item's
+// id/name. Collection notifications aren't value-gated, so they always reach us.
+async function ingestCollectionMatch(env, payload, manifest) {
+	if (!supabaseConfigured(env)) return;
+	const rsn = String(payload.playerName || "");
+	if (!rsn || !manifest.participants.has(rsn.toLowerCase())) return;
+
+	const ex = payload?.extra || {};
+	const itemId = ex.itemId ?? null;
+	const itemName = ex.itemName ?? null;
+	if (itemId == null && !itemName) return;
+
+	const match = findTrackedMatch(manifest, { id: itemId, name: itemName, source: null }, "collection");
+	if (!match) return;
+
+	const dinkTs = payload?.embeds?.[0]?.timestamp ?? new Date().toISOString();
+	const value = Number(ex.price) || 0;
+	const key = await dropKey([rsn, itemId ?? itemName, "collection", dinkTs, 1]);
+	await insertDinkDrops(env, [
+		{
+			event_id: match.event_id,
+			rsn,
+			item_id: itemId,
+			item_name: itemName,
+			quantity: 1,
+			source: "Collection log",
+			value,
+			dink_ts: dinkTs,
+			drop_key: key,
+			notif_type: "collection",
+		},
+	]);
 }
 
 function lootTotalValue(payload) {
@@ -244,6 +296,11 @@ async function handleHook(request, env, ctx, channel) {
 		if (lootTotalValue(payload) < threshold) {
 			return new Response(null, { status: 204 }); // not forwarded to Discord
 		}
+	} else if (payload.type === "COLLECTION") {
+		// Collection-log unlocks (and pets) can complete tiles too. Record matches in
+		// the background; the notification still forwards to its channel as before.
+		const manifest = await getManifest(env);
+		ctx.waitUntil(ingestCollectionMatch(env, payload, manifest));
 	}
 
 	// Forward to Discord (unchanged behaviour for everything that reaches here).
