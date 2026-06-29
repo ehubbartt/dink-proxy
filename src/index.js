@@ -282,9 +282,11 @@ async function handleHook(request, env, ctx, channel) {
 	payload.allowed_mentions = SAFE_ALLOWED_MENTIONS;
 
 	// ── LOOT: auto-tracking + Discord feed policy ────────────────────────────
-	// Because minLootValue is lowered, the proxy now sees every drop. We make two
+	// Active events' tracked items are injected into Dink's loot allowlist (see
+	// handleConfig), so the proxy receives them regardless of value. We make two
 	// independent decisions: (B) record matched drops for the bingo tracker, and
-	// (A) only forward to Discord when the drop clears FEED_MIN_VALUE.
+	// (A) only forward to Discord when the drop clears FEED_MIN_VALUE (so cheap
+	// tracked items are recorded but don't spam the achievements channel).
 	if (payload.type === "LOOT") {
 		const manifest = await getManifest(env);
 		// Decision B — ack Dink fast; do the DB write in the background.
@@ -319,14 +321,94 @@ async function handleHook(request, env, ctx, channel) {
 	return new Response(upstream.body, { status: upstream.status });
 }
 
-function handleConfig(token) {
-	const body = CONFIG_TEMPLATE_STRING.replaceAll("{{TOKEN}}", token);
+// Serve the Dink config for a token: inject the active events' tracked-item names
+// into Dink's loot allowlist (so the proxy receives those items regardless of value,
+// without lowering minLootValue to 1) and guarantee a sane minLootValue. {{TOKEN}}
+// is substituted last.
+async function handleConfig(env, token) {
+	const templateString = await getConfigTemplate(env);
+	let cfg;
+	try {
+		cfg = JSON.parse(templateString);
+	} catch {
+		cfg = {};
+	}
+
+	// Merge active tracked-item names into lootItemAllowlist (newline-separated).
+	try {
+		const manifest = await getManifest(env);
+		const names = [
+			...new Set(manifest.items.map((i) => (i.item_name || "").trim()).filter(Boolean)),
+		];
+		if (names.length) {
+			const base =
+				typeof cfg.lootItemAllowlist === "string" && cfg.lootItemAllowlist.trim()
+					? cfg.lootItemAllowlist.split("\n").map((s) => s.trim()).filter(Boolean)
+					: [];
+			// Dedupe case-insensitively, preserving the first spelling seen.
+			const seen = new Set(base.map((s) => s.toLowerCase()));
+			const merged = [...base];
+			for (const n of names) {
+				if (!seen.has(n.toLowerCase())) {
+					seen.add(n.toLowerCase());
+					merged.push(n);
+				}
+			}
+			cfg.lootItemAllowlist = merged.join("\n");
+		}
+	} catch (e) {
+		console.warn("[config] allowlist injection failed:", e.message);
+	}
+
+	// Guarantee a value threshold (the allowlist covers tracked items separately).
+	if (cfg.minLootValue == null) cfg.minLootValue = 3000000;
+
+	const body = JSON.stringify(cfg).replaceAll("{{TOKEN}}", token);
 	return new Response(body, {
 		headers: {
 			"Content-Type": "application/json",
 			"Cache-Control": "no-store",
 		},
 	});
+}
+
+// ── Dink config template (admin-editable via the site) ───────────────────────
+// The config is editable on the site as a bot_config row (config_name=dink_config)
+// and served live here, so admins can change Dink settings without a redeploy.
+// Cached in an isolate global with a TTL; falls back to the bundled template when
+// Supabase is unconfigured or the row is absent (so default behaviour is preserved).
+let configCache = { at: 0, data: null };
+
+async function fetchConfigTemplate(env) {
+	const url = `${env.SUPABASE_URL}/rest/v1/bot_config?select=config_value&config_name=eq.dink_config&limit=1`;
+	const res = await fetch(url, {
+		headers: {
+			apikey: env.SUPABASE_KEY,
+			Authorization: `Bearer ${env.SUPABASE_KEY}`,
+		},
+	});
+	if (!res.ok) throw new Error(`bot_config ${res.status}`);
+	const rows = await res.json();
+	const value = rows?.[0]?.config_value;
+	return value ? JSON.stringify(value) : null;
+}
+
+async function getConfigTemplate(env) {
+	if (!supabaseConfigured(env)) return CONFIG_TEMPLATE_STRING;
+	const ttl = Number(env.CONFIG_TTL_MS) || 60000;
+	if (configCache.data && Date.now() - configCache.at < ttl) {
+		return configCache.data;
+	}
+	try {
+		const tmpl = await fetchConfigTemplate(env);
+		const data = tmpl || CONFIG_TEMPLATE_STRING; // missing row → bundled fallback
+		configCache = { at: Date.now(), data };
+		return data;
+	} catch (e) {
+		console.warn("[config] load failed (using bundled):", e.message);
+		// Serve the last good value if we have one, else the bundled template.
+		return configCache.data || CONFIG_TEMPLATE_STRING;
+	}
 }
 
 export default {
@@ -344,7 +426,7 @@ export default {
 			if (!validTokens.has(token)) {
 				return new Response("unauthorized", { status: 401 });
 			}
-			return handleConfig(token);
+			return handleConfig(env, token);
 		}
 
 		if (
