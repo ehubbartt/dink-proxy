@@ -58,10 +58,13 @@ async function getValidTokenSet(env) {
 	return set;
 }
 
-// ── Active Event Manifest (cached in the isolate global) ─────────────────────
-// The site (Supabase) is the source of truth. We read two views: the participant
-// RSN set (clan ∪ open-event signups) and the tracked-item set for open events.
-// Cached with a short TTL so an event going live is picked up within ~TTL.
+// ── Active manifest (cached in the isolate global) ───────────────────────────
+// The site (Supabase) is the source of truth. We read two views derived from the
+// unified per-player active-tiles index: the participant RSN set (owners of any
+// active item tile — open-event signups ∪ locked personal-board owners) and the
+// flat, event-less tracked-item set (item_id, item_name, match_type). The proxy
+// only needs "is this item in play, of this notif type?"; the consumer resolves
+// the actual tile(s) per user. Cached with a short TTL.
 let manifestCache = { at: 0, data: null };
 
 function supabaseConfigured(env) {
@@ -93,11 +96,9 @@ async function getManifest(env) {
 	try {
 		const [participants, items] = await Promise.all([
 			sbGet(env, "vs_active_participants", "rsn"),
-			sbGet(
-				env,
-				"vs_active_tracked_items",
-				"event_id,tile_id,item_id,item_name,required_qty,source_name,match_type",
-			),
+			// The site's vs_active_tracked_items view (derived from vs_active_player_tiles)
+			// exposes only these columns — a flat, event-less list of trackable items.
+			sbGet(env, "vs_active_tracked_items", "item_id,item_name,match_type"),
 		]);
 		const data = {
 			participants: new Set(
@@ -121,22 +122,17 @@ async function dropKey(parts) {
 	return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Find an active tracked item matching this {id, name, source} for the given match
-// type ('loot' | 'collection'). Id match preferred, case-insensitive name fallback.
-// match_type defaults to 'loot' for rows predating the column.
-function findTrackedMatch(manifest, { id, name, source }, matchType) {
+// Is this {id, name} an active tracked item of the given match type ('loot' |
+// 'collection')? Id match preferred, case-insensitive name fallback. The tracked-item
+// set is now a flat, event-less list (no source_name/event_id) — the proxy only decides
+// "is this item in play?"; the site consumer resolves the per-user tile(s) and any
+// source/timing constraints. Returns the matched item or null.
+function findTrackedMatch(manifest, { id, name }, matchType) {
 	const nameLc = String(name || "").toLowerCase();
 	const candidates = manifest.items.filter((t) => (t.match_type || "loot") === matchType);
 	const byId = id != null ? candidates.find((t) => t.item_id === id) : undefined;
-	const match =
-		byId ||
-		(nameLc ? candidates.find((t) => String(t.item_name || "").toLowerCase() === nameLc) : undefined);
-	if (!match) return null;
-	// Optional source restriction on the tracked item (loot only, in practice).
-	if (match.source_name && String(source || "").toLowerCase() !== match.source_name.toLowerCase()) {
-		return null;
-	}
-	return match;
+	if (byId) return byId;
+	return (nameLc ? candidates.find((t) => String(t.item_name || "").toLowerCase() === nameLc) : undefined) || null;
 }
 
 // Insert matched drop rows into vs_dink_drops (dedup via drop_key). Best-effort:
@@ -180,13 +176,12 @@ async function ingestLootMatches(env, payload, manifest) {
 
 	const rows = [];
 	for (const item of items) {
-		const match = findTrackedMatch(manifest, { id: item.id, name: item.name, source }, "loot");
-		if (!match) continue;
+		if (!findTrackedMatch(manifest, { id: item.id, name: item.name }, "loot")) continue;
 		const qty = Number(item.quantity) || 1;
 		const value = (Number(item.priceEach) || 0) * qty;
 		const key = await dropKey([rsn, item.id ?? item.name, source ?? "", dinkTs, qty]);
+		// No event_id — the consumer resolves the tile(s) per user from the active index.
 		rows.push({
-			event_id: match.event_id,
 			rsn,
 			item_id: item.id ?? null,
 			item_name: item.name ?? null,
@@ -214,15 +209,15 @@ async function ingestCollectionMatch(env, payload, manifest) {
 	const itemName = ex.itemName ?? null;
 	if (itemId == null && !itemName) return;
 
-	const match = findTrackedMatch(manifest, { id: itemId, name: itemName, source: null }, "collection");
-	if (!match) return;
+	if (!findTrackedMatch(manifest, { id: itemId, name: itemName }, "collection")) return;
 
 	const dinkTs = payload?.embeds?.[0]?.timestamp ?? new Date().toISOString();
 	const value = Number(ex.price) || 0;
 	const key = await dropKey([rsn, itemId ?? itemName, "collection", dinkTs, 1]);
+	// No event_id — the consumer credits the matching event clog tile and/or the
+	// owner's personal-board tile from the active index.
 	await insertDinkDrops(env, [
 		{
-			event_id: match.event_id,
 			rsn,
 			item_id: itemId,
 			item_name: itemName,
@@ -334,11 +329,18 @@ async function handleConfig(env, token) {
 		cfg = {};
 	}
 
-	// Merge active tracked-item names into lootItemAllowlist (newline-separated).
+	// Merge active LOOT tracked-item names into lootItemAllowlist (newline-separated) so
+	// cheap loot reaches the proxy despite minLootValue. Collection-type items are excluded
+	// — they arrive via Dink's collection-log notifier regardless of value, not as loot.
 	try {
 		const manifest = await getManifest(env);
 		const names = [
-			...new Set(manifest.items.map((i) => (i.item_name || "").trim()).filter(Boolean)),
+			...new Set(
+				manifest.items
+					.filter((i) => (i.match_type || "loot") === "loot")
+					.map((i) => (i.item_name || "").trim())
+					.filter(Boolean),
+			),
 		];
 		if (names.length) {
 			const base =
