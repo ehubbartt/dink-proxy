@@ -9,5 +9,29 @@
 	"compatibility_date": "2026-05-04",
 	"observability": {
 		"enabled": true
+	},
+	// Non-secret config. Set SUPABASE_KEY (service-role or anon w/ insert RLS) as a
+	// SECRET via `npx wrangler secret put SUPABASE_KEY` — never commit it here.
+	// VALID_TOKENS and WEBHOOK_* are also secrets managed by the bot / by hand.
+	"vars": {
+		// Discord feed policy: forward LOOT to the achievements webhook only when the
+		// total drop value clears this. Active events' tracked items reach the proxy via
+		// Dink's loot allowlist (injected in handleConfig), so cheap tracked items are
+		// recorded for bingo but not forwarded to the channel.
+		"FEED_MIN_VALUE": "3000000",
+		// Supabase REST base, e.g. https://<project>.supabase.co . Leave blank to
+		// disable auto-tracking (the proxy then behaves exactly as before).
+		"SUPABASE_URL": "",
+		// Manifest cache TTL (ms) in the isolate global.
+		"MANIFEST_TTL_MS": "30000",
+		// Per-user token cache TTL (ms). Tokens are minted/revoked in the dink_tokens
+		// table by the bot and the site; the proxy validates against that set (unioned
+		// with VALID_TOKENS) and a mint/revoke takes effect within this TTL.
+		"TOKENS_TTL_MS": "30000",
+		// Dink config template cache TTL (ms). The template is admin-editable on the
+		// site (bot_config row 'dink_config'); served here with the bundled JSON as
+		// fallback. Clients re-fetch /config periodically, so edits propagate within
+		// this TTL + the client's refetch interval — no redeploy needed.
+		"CONFIG_TTL_MS": "60000"
 	}
 }
