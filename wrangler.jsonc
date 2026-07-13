@@ -21,7 +21,7 @@
 		"FEED_MIN_VALUE": "3000000",
 		// Supabase REST base, e.g. https://<project>.supabase.co . Leave blank to
 		// disable auto-tracking (the proxy then behaves exactly as before).
-		"SUPABASE_URL": "",
+		"SUPABASE_URL": "https://rrnmckaabbvtkkpoeefg.supabase.co",
 		// Manifest cache TTL (ms) in the isolate global.
 		"MANIFEST_TTL_MS": "30000",
 		// Per-user token cache TTL (ms). Tokens are minted/revoked in the dink_tokens
