@@ -27,10 +27,10 @@ function getValidTokens (env) {
 //   2. the legacy VALID_TOKENS secret (kept as a fallback / for the bot's syncWorker).
 // The Supabase set is cached in an isolate global with a short TTL so a freshly
 // minted or revoked token takes effect within ~TTL without a redeploy.
-let tokensCache = { at: 0, set: null };
+let tokensCache = { at: 0, set: null, multi: new Set() };
 
 async function fetchDinkTokens (env) {
-	const url = `${env.SUPABASE_URL}/rest/v1/dink_tokens?select=token&revoked_at=is.null`;
+	const url = `${env.SUPABASE_URL}/rest/v1/dink_tokens?select=token,multi_server&revoked_at=is.null`;
 	const res = await fetch(url, {
 		headers: {
 			apikey: env.SUPABASE_KEY,
@@ -39,7 +39,7 @@ async function fetchDinkTokens (env) {
 	});
 	if (!res.ok) throw new Error(`dink_tokens ${res.status}`);
 	const rows = await res.json();
-	return (rows || []).map((r) => r.token).filter(Boolean);
+	return (rows || []).filter((r) => r.token);
 }
 
 async function getValidTokenSet (env) {
@@ -48,14 +48,26 @@ async function getValidTokenSet (env) {
 	const ttl = Number(env.TOKENS_TTL_MS) || 30000;
 	if (!tokensCache.set || Date.now() - tokensCache.at >= ttl) {
 		try {
-			tokensCache = { at: Date.now(), set: new Set(await fetchDinkTokens(env)) };
+			const rows = await fetchDinkTokens(env);
+			tokensCache = {
+				at: Date.now(),
+				set: new Set(rows.map((r) => r.token)),
+				multi: new Set(rows.filter((r) => r.multi_server === true).map((r) => r.token)),
+			};
 		} catch (e) {
 			console.warn("[tokens] load failed:", e.message);
-			if (!tokensCache.set) tokensCache = { at: Date.now(), set: new Set() };
+			if (!tokensCache.set) tokensCache = { at: Date.now(), set: new Set(), multi: new Set() };
 		}
 	}
 	for (const t of tokensCache.set) set.add(t);
 	return set;
+}
+
+// Was this token flagged multi-server (dink_tokens.multi_server, set from the
+// site's /dink-check page)? Reads the cache getValidTokenSet just refreshed —
+// legacy VALID_TOKENS entries are never multi-server.
+function isMultiServerToken (token) {
+	return tokensCache.multi.has(token);
 }
 
 // ── Active manifest (cached in the isolate global) ───────────────────────────
@@ -375,6 +387,9 @@ async function handleHook (request, env, ctx, channel) {
 // into Dink's loot allowlist (so the proxy receives those items regardless of value,
 // without lowering minLootValue to 1) and guarantee a sane minLootValue. {{TOKEN}}
 // is substituted last.
+// Floor applied to multi-server tokens regardless of what the admin template says.
+const MULTI_SERVER_MIN_LOOT = 3000000;
+
 async function handleConfig (env, token) {
 	const templateString = await getConfigTemplate(env);
 	let cfg;
@@ -419,6 +434,16 @@ async function handleConfig (env, token) {
 
 	// Guarantee a value threshold (the allowlist covers tracked items separately).
 	if (cfg.minLootValue == null) cfg.minLootValue = 3000000;
+
+	// Multi-server members (dink_tokens.multi_server, the /dink-check checkbox) must
+	// NEVER be served a low threshold: their Dink also posts to other Discord servers,
+	// and the standard config's minLootValue of 1 fires those webhooks on every drop.
+	// The allowlist above already whitelists their tracked tiles, so the tracker still
+	// receives everything it needs. They reload the config (plugin toggle) whenever
+	// their boards/tiles change.
+	if (isMultiServerToken(token)) {
+		cfg.minLootValue = Math.max(Number(cfg.minLootValue) || 0, MULTI_SERVER_MIN_LOOT);
+	}
 
 	const body = JSON.stringify(cfg).replaceAll("{{TOKEN}}", token);
 	return new Response(body, {
