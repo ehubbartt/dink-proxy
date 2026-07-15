@@ -285,10 +285,38 @@ async function ingestCollectionMatch (env, payload, manifest, screenshot) {
 	]);
 }
 
-function lootTotalValue (payload) {
+// ── Discord feed policy (LOOT) ───────────────────────────────────────────────
+// A notification is feed-worthy only if a single STACK (quantity × unit price)
+// clears the threshold — never the summed total, so a kingdom/herb-run dump of
+// twenty cheap stacks stays out of the channel while one 3m+ stack (or 3 x 1m
+// of the same item) posts. Returns the qualifying stacks.
+function feedWorthyStacks (payload, threshold) {
 	const items = payload?.extra?.items;
-	if (!Array.isArray(items)) return 0;
-	return items.reduce((sum, it) => sum + (Number(it.quantity) || 0) * (Number(it.priceEach) || 0), 0);
+	if (!Array.isArray(items)) return [];
+	return items.filter(
+		(it) => (Number(it.quantity) || 0) * (Number(it.priceEach) || 0) >= threshold,
+	);
+}
+
+// Trim the forwarded embed to the qualifying stacks: Dink's loot embed lists one
+// "<qty> x <name> (<value>)" line per stack, so drop the lines for stacks under
+// the threshold and keep every non-item line (header, From:, blanks). If the
+// embed doesn't match that shape (format change, custom template), it forwards
+// untouched — the per-stack gate above still applies either way.
+function trimLootEmbed (payload, keepStacks) {
+	const embed = payload?.embeds?.[0];
+	if (!embed || typeof embed.description !== "string") return;
+	const keepNames = new Set(keepStacks.map((it) => String(it.name || "").toLowerCase()));
+	const itemLine = /^\s*[\d,]+ x (.+?) \([^)]*\)\s*$/;
+	const lines = embed.description.split("\n");
+	const kept = lines.filter((line) => {
+		const m = itemLine.exec(line);
+		if (!m) return true; // not an item line — keep
+		return keepNames.has(m[1].toLowerCase());
+	});
+	if (kept.length && kept.length < lines.length) {
+		embed.description = kept.join("\n");
+	}
 }
 
 async function handleHook (request, env, ctx, channel) {
@@ -347,19 +375,24 @@ async function handleHook (request, env, ctx, channel) {
 	// Active events' tracked items are injected into Dink's loot allowlist (see
 	// handleConfig), so the proxy receives them regardless of value. We make two
 	// independent decisions: (B) record matched drops for the bingo tracker, and
-	// (A) only forward to Discord when the drop clears FEED_MIN_VALUE (so cheap
-	// tracked items are recorded but don't spam the achievements channel).
+	// (A) only forward to Discord when a SINGLE STACK clears FEED_MIN_VALUE —
+	// the summed total is never used, so cheap tracked items and multi-stack
+	// dumps are recorded but don't spam the achievements channel.
 	if (payload.type === "LOOT") {
 		const manifest = await getManifest(env);
-		// Decision B — ack Dink fast; do the DB write in the background.
+		// Decision B — ack Dink fast; do the DB write in the background. (Runs on
+		// the full, untrimmed item list regardless of the feed decision below.)
 		ctx.waitUntil(ingestLootMatches(env, payload, manifest, screenshot));
 
-		// Decision A — Discord feed threshold.
+		// Decision A — Discord feed threshold, judged per stack.
 		const feedMin = Number(env.FEED_MIN_VALUE);
 		const threshold = Number.isFinite(feedMin) ? feedMin : 3000000;
-		if (lootTotalValue(payload) < threshold) {
+		const bigStacks = feedWorthyStacks(payload, threshold);
+		if (bigStacks.length === 0) {
 			return new Response(null, { status: 204 }); // not forwarded to Discord
 		}
+		// Only the qualifying stacks appear in the channel.
+		trimLootEmbed(payload, bigStacks);
 	} else if (payload.type === "COLLECTION") {
 		// Collection-log unlocks (and pets) can complete tiles too. Record matches in
 		// the background; the notification still forwards to its channel as before.
@@ -390,6 +423,22 @@ async function handleHook (request, env, ctx, channel) {
 // Floor applied to multi-server tokens regardless of what the admin template says.
 const MULTI_SERVER_MIN_LOOT = 3000000;
 
+// Per-token allowlist rows: only the items ACTIVE for the member who owns this
+// token (their event signups + locked personal board), via the site's
+// vs_dink_token_items view. Completed tiles are already excluded there, so an
+// item leaves the member's allowlist on the next config serve.
+async function fetchTokenLootItems (env, token) {
+	const url = `${env.SUPABASE_URL}/rest/v1/vs_dink_token_items?select=item_name,match_type&token=eq.${encodeURIComponent(token)}`;
+	const res = await fetch(url, {
+		headers: {
+			apikey: env.SUPABASE_KEY,
+			Authorization: `Bearer ${env.SUPABASE_KEY}`,
+		},
+	});
+	if (!res.ok) throw new Error(`vs_dink_token_items ${res.status}`);
+	return res.json();
+}
+
 async function handleConfig (env, token) {
 	const templateString = await getConfigTemplate(env);
 	let cfg;
@@ -399,14 +448,27 @@ async function handleConfig (env, token) {
 		cfg = {};
 	}
 
-	// Merge active LOOT tracked-item names into lootItemAllowlist (newline-separated) so
-	// cheap loot reaches the proxy despite minLootValue. Collection-type items are excluded
-	// — they arrive via Dink's collection-log notifier regardless of value, not as loot.
+	// Merge THIS MEMBER's active LOOT tracked-item names into lootItemAllowlist
+	// (newline-separated) so their cheap tracked loot reaches the proxy despite
+	// minLootValue. Per-token on purpose: the clan-wide union kept items in
+	// everyone's allowlist until NOBODY tracked them. The union is only the
+	// fallback when the per-token lookup FAILS — an empty result is a valid
+	// answer (no active tiles → nothing to inject), not a failure.
+	// Collection-type items are excluded — they arrive via Dink's collection-log
+	// notifier regardless of value, not as loot.
 	try {
-		const manifest = await getManifest(env);
+		let rows = null;
+		if (supabaseConfigured(env)) {
+			try {
+				rows = await fetchTokenLootItems(env, token);
+			} catch (e) {
+				console.warn("[config] per-token items failed (using clan union):", e.message);
+			}
+		}
+		const items = rows ?? (await getManifest(env)).items;
 		const names = [
 			...new Set(
-				manifest.items
+				items
 					.filter((i) => (i.match_type || "loot") === "loot")
 					.map((i) => (i.item_name || "").trim())
 					.filter(Boolean),
