@@ -288,7 +288,7 @@ async function ingestCollectionMatch (env, payload, manifest, screenshot) {
 // ── Discord feed policy (LOOT) ───────────────────────────────────────────────
 // A notification is feed-worthy only if a single STACK (quantity × unit price)
 // clears the threshold — never the summed total, so a kingdom/herb-run dump of
-// twenty cheap stacks stays out of the channel while one 3m+ stack (or 3 x 1m
+// many cheap stacks stays out of the channel while one 3m+ stack (or e.g. 3 × 1m
 // of the same item) posts. Returns the qualifying stacks.
 function feedWorthyStacks (payload, threshold) {
 	const items = payload?.extra?.items;
@@ -298,21 +298,36 @@ function feedWorthyStacks (payload, threshold) {
 	);
 }
 
-// Trim the forwarded embed to the qualifying stacks: Dink's loot embed lists one
-// "<qty> x <name> (<value>)" line per stack, so drop the lines for stacks under
-// the threshold and keep every non-item line (header, From:, blanks). If the
-// embed doesn't match that shape (format change, custom template), it forwards
-// untouched — the per-stack gate above still applies either way.
-function trimLootEmbed (payload, keepStacks) {
+// Trim the forwarded loot embed to the qualifying stacks. Robust to `lootIcons`
+// emoji prefixes and markdown-linked item names ("N x [Name](wiki-url) (value)"):
+// we DON'T parse the line shape — we drop any description line that mentions a
+// sub-threshold item's name and no over-threshold item's name, keying off the
+// structured payload.extra.items (the same data the feed gate uses). Header / From: /
+// blank lines mention no item and are kept. If the description carries no
+// sub-threshold item at all, it's left untouched.
+function trimLootEmbed (payload, threshold) {
 	const embed = payload?.embeds?.[0];
 	if (!embed || typeof embed.description !== "string") return;
-	const keepNames = new Set(keepStacks.map((it) => String(it.name || "").toLowerCase()));
-	const itemLine = /^\s*[\d,]+ x (.+?) \([^)]*\)\s*$/;
+	const items = payload?.extra?.items;
+	if (!Array.isArray(items) || items.length === 0) return;
+
+	const stackValue = (it) => (Number(it.quantity) || 0) * (Number(it.priceEach) || 0);
+	const smallNames = items
+		.filter((it) => stackValue(it) < threshold)
+		.map((it) => String(it.name || "").toLowerCase())
+		.filter(Boolean);
+	const bigNames = items
+		.filter((it) => stackValue(it) >= threshold)
+		.map((it) => String(it.name || "").toLowerCase())
+		.filter(Boolean);
+	if (!smallNames.length) return; // nothing sub-threshold to strip
+
 	const lines = embed.description.split("\n");
 	const kept = lines.filter((line) => {
-		const m = itemLine.exec(line);
-		if (!m) return true; // not an item line — keep
-		return keepNames.has(m[1].toLowerCase());
+		const lc = line.toLowerCase();
+		const hasSmall = smallNames.some((n) => lc.includes(n));
+		const hasBig = bigNames.some((n) => lc.includes(n));
+		return hasBig || !hasSmall; // keep big-item and non-item lines; drop small-only lines
 	});
 	if (kept.length && kept.length < lines.length) {
 		embed.description = kept.join("\n");
@@ -375,8 +390,8 @@ async function handleHook (request, env, ctx, channel) {
 	// Active events' tracked items are injected into Dink's loot allowlist (see
 	// handleConfig), so the proxy receives them regardless of value. We make two
 	// independent decisions: (B) record matched drops for the bingo tracker, and
-	// (A) only forward to Discord when a SINGLE STACK clears FEED_MIN_VALUE —
-	// the summed total is never used, so cheap tracked items and multi-stack
+	// (A) only forward to Discord when a SINGLE STACK clears FEED_MIN_VALUE — the
+	// summed total is never used, so cheap tracked items and multi-stack junk
 	// dumps are recorded but don't spam the achievements channel.
 	if (payload.type === "LOOT") {
 		const manifest = await getManifest(env);
@@ -392,7 +407,7 @@ async function handleHook (request, env, ctx, channel) {
 			return new Response(null, { status: 204 }); // not forwarded to Discord
 		}
 		// Only the qualifying stacks appear in the channel.
-		trimLootEmbed(payload, bigStacks);
+		trimLootEmbed(payload, threshold);
 	} else if (payload.type === "COLLECTION") {
 		// Collection-log unlocks (and pets) can complete tiles too. Record matches in
 		// the background; the notification still forwards to its channel as before.
@@ -423,10 +438,6 @@ async function handleHook (request, env, ctx, channel) {
 // Floor applied to multi-server tokens regardless of what the admin template says.
 const MULTI_SERVER_MIN_LOOT = 3000000;
 
-// Per-token allowlist rows: only the items ACTIVE for the member who owns this
-// token (their event signups + locked personal board), via the site's
-// vs_dink_token_items view. Completed tiles are already excluded there, so an
-// item leaves the member's allowlist on the next config serve.
 async function fetchTokenLootItems (env, token) {
 	const url = `${env.SUPABASE_URL}/rest/v1/vs_dink_token_items?select=item_name,match_type&token=eq.${encodeURIComponent(token)}`;
 	const res = await fetch(url, {
@@ -453,9 +464,9 @@ async function handleConfig (env, token) {
 	// minLootValue. Per-token on purpose: the clan-wide union kept items in
 	// everyone's allowlist until NOBODY tracked them. The union is only the
 	// fallback when the per-token lookup FAILS — an empty result is a valid
-	// answer (no active tiles → nothing to inject), not a failure.
-	// Collection-type items are excluded — they arrive via Dink's collection-log
-	// notifier regardless of value, not as loot.
+	// answer (no active tiles → nothing to inject), not a failure. Collection-type
+	// items are excluded — they arrive via Dink's collection-log notifier
+	// regardless of value, not as loot.
 	try {
 		let rows = null;
 		if (supabaseConfigured(env)) {
@@ -499,10 +510,10 @@ async function handleConfig (env, token) {
 
 	// Multi-server members (dink_tokens.multi_server, the /dink-check checkbox) must
 	// NEVER be served a low threshold: their Dink also posts to other Discord servers,
-	// and the standard config's minLootValue of 1 fires those webhooks on every drop.
-	// The allowlist above already whitelists their tracked tiles, so the tracker still
-	// receives everything it needs. They reload the config (plugin toggle) whenever
-	// their boards/tiles change.
+	// and a low minLootValue would fire those webhooks on every drop. The allowlist
+	// above already whitelists their tracked tiles, so the tracker still receives
+	// everything it needs. They reload the config (plugin toggle) whenever their
+	// boards/tiles change.
 	if (isMultiServerToken(token)) {
 		cfg.minLootValue = Math.max(Number(cfg.minLootValue) || 0, MULTI_SERVER_MIN_LOOT);
 	}
