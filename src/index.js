@@ -298,40 +298,69 @@ function feedWorthyStacks (payload, threshold) {
 	);
 }
 
-// Trim the forwarded loot embed to the qualifying stacks. Robust to `lootIcons`
-// emoji prefixes and markdown-linked item names ("N x [Name](wiki-url) (value)"):
-// we DON'T parse the line shape — we drop any description line that mentions a
-// sub-threshold item's name and no over-threshold item's name, keying off the
-// structured payload.extra.items (the same data the feed gate uses). Header / From: /
-// blank lines mention no item and are kept. If the description carries no
-// sub-threshold item at all, it's left untouched.
-function trimLootEmbed (payload, threshold) {
-	const embed = payload?.embeds?.[0];
-	if (!embed || typeof embed.description !== "string") return;
+// Pull the OSRS item id out of a RuneLite icon URL
+// (https://static.runelite.net/cache/item/icon/<id>.png) — the id Dink stamps on
+// each per-item image embed. Returns null if the url isn't a recognizable item icon.
+function iconItemId (embed) {
+	const url = embed?.image?.url;
+	if (typeof url !== "string") return null;
+	const m = url.match(/\/item\/icon\/(\d+)/);
+	return m ? Number(m[1]) : null;
+}
+
+// Trim a forwarded LOOT message down to the qualifying (feed-worthy) stacks. Dink
+// sends ONE main embed whose description lists every looted item, followed by one
+// image-only embed per item (its icon at .../item/icon/<id>.png) — Discord renders
+// those trailing embeds as the row of item pictures. We do TWO things, both keyed off
+// the structured payload.extra.items (the same data the feed gate uses):
+//   1. Drop the main embed's description lines that mention only sub-threshold items.
+//      Robust to `lootIcons` emoji prefixes and markdown-linked names ("N x
+//      [Name](wiki-url) (value)") — we match on item name, not line shape; header /
+//      "From:" / blank lines mention no item and are kept.
+//   2. Drop the trailing per-item icon embeds whose item is sub-threshold, so the
+//      channel no longer shows pictures of the cheap items we filtered out of the text.
+// Anything we can't classify is kept: the main embed (index 0), non-icon image embeds,
+// and icons whose id isn't in the item list. If nothing is sub-threshold, it's a no-op.
+function trimLootMessage (payload, threshold) {
+	const embeds = payload?.embeds;
 	const items = payload?.extra?.items;
+	if (!Array.isArray(embeds) || embeds.length === 0) return;
 	if (!Array.isArray(items) || items.length === 0) return;
 
 	const stackValue = (it) => (Number(it.quantity) || 0) * (Number(it.priceEach) || 0);
-	const smallNames = items
-		.filter((it) => stackValue(it) < threshold)
-		.map((it) => String(it.name || "").toLowerCase())
-		.filter(Boolean);
-	const bigNames = items
-		.filter((it) => stackValue(it) >= threshold)
-		.map((it) => String(it.name || "").toLowerCase())
-		.filter(Boolean);
-	if (!smallNames.length) return; // nothing sub-threshold to strip
+	const big = items.filter((it) => stackValue(it) >= threshold);
+	const small = items.filter((it) => stackValue(it) < threshold);
+	if (!small.length) return; // nothing sub-threshold to strip
 
-	const lines = embed.description.split("\n");
-	const kept = lines.filter((line) => {
-		const lc = line.toLowerCase();
-		const hasSmall = smallNames.some((n) => lc.includes(n));
-		const hasBig = bigNames.some((n) => lc.includes(n));
-		return hasBig || !hasSmall; // keep big-item and non-item lines; drop small-only lines
-	});
-	if (kept.length && kept.length < lines.length) {
-		embed.description = kept.join("\n");
+	const bigNames = big.map((it) => String(it.name || "").toLowerCase()).filter(Boolean);
+	const smallNames = small.map((it) => String(it.name || "").toLowerCase()).filter(Boolean);
+	const bigIds = new Set(big.map((it) => it.id).filter((id) => id != null).map(Number));
+	const smallIds = new Set(small.map((it) => it.id).filter((id) => id != null).map(Number));
+
+	// 1. Trim the main embed's description to the qualifying items.
+	const main = embeds[0];
+	if (main && typeof main.description === "string" && smallNames.length) {
+		const lines = main.description.split("\n");
+		const kept = lines.filter((line) => {
+			const lc = line.toLowerCase();
+			const hasSmall = smallNames.some((n) => lc.includes(n));
+			const hasBig = bigNames.some((n) => lc.includes(n));
+			return hasBig || !hasSmall; // keep big-item and non-item lines; drop small-only lines
+		});
+		if (kept.length && kept.length < lines.length) {
+			main.description = kept.join("\n");
+		}
 	}
+
+	// 2. Drop the trailing per-item icon embeds for sub-threshold items. An icon whose
+	//    item is also a big stack (shouldn't happen — one stack is either big or small)
+	//    is kept, so a genuine over-threshold picture never gets dropped.
+	payload.embeds = embeds.filter((embed, i) => {
+		if (i === 0) return true; // main embed always kept
+		const id = iconItemId(embed);
+		if (id == null) return true; // not a recognizable item icon → keep
+		return !(smallIds.has(id) && !bigIds.has(id));
+	});
 }
 
 async function handleHook (request, env, ctx, channel) {
@@ -406,8 +435,8 @@ async function handleHook (request, env, ctx, channel) {
 		if (bigStacks.length === 0) {
 			return new Response(null, { status: 204 }); // not forwarded to Discord
 		}
-		// Only the qualifying stacks appear in the channel.
-		trimLootEmbed(payload, threshold);
+		// Only the qualifying stacks appear in the channel (text + item icons).
+		trimLootMessage(payload, threshold);
 	} else if (payload.type === "COLLECTION") {
 		// Collection-log unlocks (and pets) can complete tiles too. Record matches in
 		// the background; the notification still forwards to its channel as before.
