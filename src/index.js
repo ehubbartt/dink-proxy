@@ -19,6 +19,18 @@ const FORWARD_TYPES = new Set(["LOOT", "COLLECTION", "DEATH", "PET"]);
 
 const CONFIG_TEMPLATE_STRING = JSON.stringify(dinkConfigTemplate);
 
+// Canonical loot allowlist from the BUNDLED template — guaranteed correctly
+// newline-separated. Used as the always-present base when serving a config, so a
+// mangled live-config value (e.g. newlines lost on save, collapsing the items into
+// one un-matchable line) can never drop these permanently-tracked items from what
+// Dink receives. Edit the bundled dinkconfig-template.json to change this set.
+const BASE_LOOT_ALLOWLIST = (typeof dinkConfigTemplate.lootItemAllowlist === "string"
+	? dinkConfigTemplate.lootItemAllowlist.split("\n")
+	: []
+)
+	.map((s) => s.trim())
+	.filter(Boolean);
+
 function getValidTokens (env) {
 	return new Set(
 		(env.VALID_TOKENS || "")
@@ -526,30 +538,32 @@ async function handleConfig (env, token) {
 			}
 		}
 		const items = rows ?? (await getManifest(env)).items;
-		const names = [
-			...new Set(
-				items
-					.filter((i) => (i.match_type || "loot") === "loot")
-					.map((i) => (i.item_name || "").trim())
-					.filter(Boolean),
-			),
-		];
-		if (names.length) {
-			const base =
-				typeof cfg.lootItemAllowlist === "string" && cfg.lootItemAllowlist.trim()
-					? cfg.lootItemAllowlist.split("\n").map((s) => s.trim()).filter(Boolean)
-					: [];
-			// Dedupe case-insensitively, preserving the first spelling seen.
-			const seen = new Set(base.map((s) => s.toLowerCase()));
-			const merged = [...base];
-			for (const n of names) {
-				if (!seen.has(n.toLowerCase())) {
-					seen.add(n.toLowerCase());
-					merged.push(n);
-				}
+		const names = items
+			.filter((i) => (i.match_type || "loot") === "loot")
+			.map((i) => (i.item_name || "").trim())
+			.filter(Boolean);
+		// Whatever the live config lists (split on newlines; may be a single mangled
+		// blob if the stored value lost its newlines — harmless, it just never matches).
+		const served =
+			typeof cfg.lootItemAllowlist === "string"
+				? cfg.lootItemAllowlist.split("\n").map((s) => s.trim()).filter(Boolean)
+				: [];
+		// Always rebuild the allowlist as: guaranteed bundled base ∪ live-config items ∪
+		// this member's injected tracked items — deduped case-insensitively, always
+		// correctly newline-separated. Sourcing the base from BASE_LOOT_ALLOWLIST means
+		// a mangled live value can't drop the permanent items; running unconditionally
+		// (not only when names.length) means the base is repaired even for a member with
+		// no active tiles.
+		const seen = new Set();
+		const merged = [];
+		for (const n of [...BASE_LOOT_ALLOWLIST, ...served, ...names]) {
+			const lc = n.toLowerCase();
+			if (!seen.has(lc)) {
+				seen.add(lc);
+				merged.push(n);
 			}
-			cfg.lootItemAllowlist = merged.join("\n");
 		}
+		if (merged.length) cfg.lootItemAllowlist = merged.join("\n");
 	} catch (e) {
 		console.warn("[config] allowlist injection failed:", e.message);
 	}
