@@ -425,6 +425,16 @@ async function handleHook (request, env, ctx, channel) {
 		return new Response("unsupported content type", { status: 415 });
 	}
 
+	// Targeted debug logging: when the DEBUG_LOG_RSN secret is set, log the full inbound
+	// payload for ONLY that player (case-insensitive), so you can inspect exactly what YOUR
+	// account sends — every type, including ones dropped below — without the whole clan's
+	// traffic in the logs. Worker-side only (view with `wrangler tail` or the dashboard Logs);
+	// never forwarded to Discord. Unset the secret to turn it off.
+	const debugRsn = (env.DEBUG_LOG_RSN || "").trim().toLowerCase();
+	if (debugRsn && String(payload.playerName || "").toLowerCase() === debugRsn) {
+		console.log("[debug]", channel, JSON.stringify(payload));
+	}
+
 	// Fail-closed trust boundary: only relay the notification types we format and
 	// fully understand (see FORWARD_TYPES). Anything else — external-plugin "send to
 	// Dink" notifications, chat triggers, levels, quests, unknown or spoofed types — is
