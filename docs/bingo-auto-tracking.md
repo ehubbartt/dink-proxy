@@ -4,9 +4,27 @@ Design doc for turning the dink-proxy Worker into an automatic bingo drop tracke
 qualifying OSRS drops are credited to active bingo tiles without players submitting screenshots
 and admins approving them by hand.
 
-> Status: **proposal**. Nothing here is built yet. This documents the intended change to
-> `dink-proxy` and how it hooks into the existing (currently archived) bingo system in
-> `voli-disc-bot`.
+> Status: **built & superseded.** Auto-tracking now runs against the **volition-site** event
+> system (not the archived bot bingo described below). The proxy is a dumb filter/recorder:
+> it reads the live views `vs_active_participants` / `vs_active_tracked_items` (and per-token
+> `vs_dink_token_items`) that the site derives, records matched drops to `vs_dink_drops`, and
+> the site's `processDinkDrops` credits tiles. Current behaviour that differs from the
+> proposal below:
+>
+> - **Allowlist injection** (`handleConfig`) injects **every** tracked item name for the token
+>   (loot- and collection-tagged alike — "watch both ways"), so a mis-tagged item can't be
+>   kept out of the allowlist.
+> - **Matching is `match_type`-agnostic** (`findTrackedMatch`): a drop is recorded if the item
+>   is tracked at all, whether it arrived as LOOT or a COLLECTION unlock; the site credits on
+>   whichever fires first (idempotent).
+> - **Per-token last-good cache**: on a transient `vs_dink_token_items` error the proxy serves
+>   the member's OWN last-known items (or nothing), **never** the clan-wide union.
+> - **`CLAN_ALWAYS_WATCH`** (bundled `lootItemAllowlist`) is a deliberate clan-wide FEED list,
+>   always served, separate from per-member tracking.
+>
+> Canonical design lives in
+> `volition-site/docs/event-builder-and-dink-tracking.md`. The rest of this file is the
+> original proposal, kept for history.
 
 ---
 

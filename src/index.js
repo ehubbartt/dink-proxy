@@ -19,12 +19,14 @@ const FORWARD_TYPES = new Set(["LOOT", "COLLECTION", "DEATH", "PET"]);
 
 const CONFIG_TEMPLATE_STRING = JSON.stringify(dinkConfigTemplate);
 
-// Canonical loot allowlist from the BUNDLED template — guaranteed correctly
-// newline-separated. Used as the always-present base when serving a config, so a
-// mangled live-config value (e.g. newlines lost on save, collapsing the items into
-// one un-matchable line) can never drop these permanently-tracked items from what
-// Dink receives. Edit the bundled dinkconfig-template.json to change this set.
-const BASE_LOOT_ALLOWLIST = (typeof dinkConfigTemplate.lootItemAllowlist === "string"
+// Clan-wide ALWAYS-WATCH list, sourced from the bundled template's lootItemAllowlist.
+// This is a DELIBERATE clan-wide FEED concern — marquee drops (vestiges, etc.) we always
+// want reaching the Discord feed even for a member with no bingo tiles — and is SEPARATE
+// from per-member tile tracking (injected per token in handleConfig, which does NOT depend
+// on this list). It's always served, so it also survives a mangled live-config allowlist.
+// Edit the bundled dinkconfig-template.json to change this set. (It is not "what a member
+// is tracking"; per-member creditable items are the vs_dink_token_items injection below.)
+const CLAN_ALWAYS_WATCH = (typeof dinkConfigTemplate.lootItemAllowlist === "string"
 	? dinkConfigTemplate.lootItemAllowlist.split("\n")
 	: []
 )
@@ -155,17 +157,17 @@ async function dropKey (parts) {
 	return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-// Is this {id, name} an active tracked item of the given match type ('loot' |
-// 'collection')? Id match preferred, case-insensitive name fallback. The tracked-item
-// set is now a flat, event-less list (no source_name/event_id) — the proxy only decides
-// "is this item in play?"; the site consumer resolves the per-user tile(s) and any
-// source/timing constraints. Returns the matched item or null.
-function findTrackedMatch (manifest, { id, name }, matchType) {
+// Is this {id, name} an active tracked item? Id match preferred, case-insensitive name
+// fallback. WATCH BOTH WAYS: we no longer filter by match_type — the proxy records a drop
+// if the item is tracked at all, whether it arrived as a LOOT drop or a COLLECTION unlock,
+// and the site consumer credits on either (idempotency makes a double-fire safe). This
+// closes the "mis-tagged match_type → never tracked" gap. The tracked-item set is a flat,
+// event-less list; the proxy only decides "is this item in play?". Returns the item or null.
+function findTrackedMatch (manifest, { id, name }) {
 	const nameLc = String(name || "").toLowerCase();
-	const candidates = manifest.items.filter((t) => (t.match_type || "loot") === matchType);
-	const byId = id != null ? candidates.find((t) => t.item_id === id) : undefined;
+	const byId = id != null ? manifest.items.find((t) => t.item_id === id) : undefined;
 	if (byId) return byId;
-	return (nameLc ? candidates.find((t) => String(t.item_name || "").toLowerCase() === nameLc) : undefined) || null;
+	return (nameLc ? manifest.items.find((t) => String(t.item_name || "").toLowerCase() === nameLc) : undefined) || null;
 }
 
 // Upload a Dink screenshot to the site's public proofs bucket and return its public
@@ -228,10 +230,10 @@ async function insertDinkDrops (env, rows) {
 	}
 }
 
-// Decision B (LOOT): record any looted item that belongs to an active loot-type
-// tracked-item set AND was dropped by a known participant. If the client attached a
-// screenshot, it's uploaded once and stamped on every matched row from this kill —
-// the site copies it into the credited tile's proof images.
+// Decision B (LOOT): record any looted item that belongs to the active tracked-item set
+// (any match_type — watch both ways) AND was dropped by a known participant. If the client
+// attached a screenshot, it's uploaded once and stamped on every matched row from this kill
+// — the site copies it into the credited tile's proof images.
 async function ingestLootMatches (env, payload, manifest, screenshot) {
 	if (!supabaseConfigured(env)) return;
 	const rsn = String(payload.playerName || "");
@@ -245,7 +247,7 @@ async function ingestLootMatches (env, payload, manifest, screenshot) {
 
 	const rows = [];
 	for (const item of items) {
-		if (!findTrackedMatch(manifest, { id: item.id, name: item.name }, "loot")) continue;
+		if (!findTrackedMatch(manifest, { id: item.id, name: item.name })) continue;
 		const qty = Number(item.quantity) || 1;
 		const value = (Number(item.priceEach) || 0) * qty;
 		const key = await dropKey([rsn, item.id ?? item.name, source ?? "", dinkTs, qty]);
@@ -270,8 +272,10 @@ async function ingestLootMatches (env, payload, manifest, screenshot) {
 }
 
 // Decision B (COLLECTION): a collection-log unlock (also how pets register, since a
-// pet is a clog slot). Matches collection-type tracked items by the unlocked item's
-// id/name. Collection notifications aren't value-gated, so they always reach us.
+// pet is a clog slot). Matches the unlocked item against the tracked-item set by id/name
+// (any match_type — watch both ways). Collection notifications aren't value-gated, so they
+// always reach us — which is why a multi-server member's tile can credit via a clog unlock
+// without a Dink config reload.
 async function ingestCollectionMatch (env, payload, manifest, screenshot) {
 	if (!supabaseConfigured(env)) return;
 	const rsn = String(payload.playerName || "");
@@ -282,7 +286,7 @@ async function ingestCollectionMatch (env, payload, manifest, screenshot) {
 	const itemName = ex.itemName ?? null;
 	if (itemId == null && !itemName) return;
 
-	if (!findTrackedMatch(manifest, { id: itemId, name: itemName }, "collection")) return;
+	if (!findTrackedMatch(manifest, { id: itemId, name: itemName })) return;
 
 	const dinkTs = payload?.embeds?.[0]?.timestamp ?? new Date().toISOString();
 	const value = Number(ex.price) || 0;
@@ -492,12 +496,17 @@ async function handleHook (request, env, ctx, channel) {
 	return new Response(upstream.body, { status: upstream.status });
 }
 
-// Serve the Dink config for a token: inject the active events' tracked-item names
-// into Dink's loot allowlist (so the proxy receives those items regardless of value,
-// without lowering minLootValue to 1) and guarantee a sane minLootValue. {{TOKEN}}
-// is substituted last.
+// Serve the Dink config for a token: inject THIS member's tracked-item names into Dink's
+// loot allowlist (so the proxy receives those items regardless of value, without lowering
+// minLootValue to 1) and guarantee a sane minLootValue. {{TOKEN}} is substituted last.
 // Floor applied to multi-server tokens regardless of what the admin template says.
 const MULTI_SERVER_MIN_LOOT = 3000000;
+
+// Per-token LAST-GOOD tracked-item cache. On a transient vs_dink_token_items error we serve
+// the member's OWN last-known items (or nothing) — NEVER the clan-wide union, so one member
+// can never be polluted with the whole clan's items. Isolate-local, clan-bounded (one entry
+// per active token), no eviction needed.
+let tokenItemsCache = new Map(); // token → { at:number, items:[{item_name, match_type}] }
 
 async function fetchTokenLootItems (env, token) {
 	const url = `${env.SUPABASE_URL}/rest/v1/vs_dink_token_items?select=item_name,match_type&token=eq.${encodeURIComponent(token)}`;
@@ -520,43 +529,50 @@ async function handleConfig (env, token) {
 		cfg = {};
 	}
 
-	// Merge THIS MEMBER's active LOOT tracked-item names into lootItemAllowlist
-	// (newline-separated) so their cheap tracked loot reaches the proxy despite
-	// minLootValue. Per-token on purpose: the clan-wide union kept items in
-	// everyone's allowlist until NOBODY tracked them. The union is only the
-	// fallback when the per-token lookup FAILS — an empty result is a valid
-	// answer (no active tiles → nothing to inject), not a failure. Collection-type
-	// items are excluded — they arrive via Dink's collection-log notifier
-	// regardless of value, not as loot.
+	// Merge THIS MEMBER's tracked-item names into lootItemAllowlist (newline-separated) so
+	// their cheap tracked loot reaches the proxy despite minLootValue. Per-token on purpose;
+	// on a transient error we fall back to the member's OWN last-good set (see cache), never
+	// the clan-wide union — an empty result is a valid answer (no active tiles → nothing to
+	// inject), not a failure.
 	try {
-		let rows = null;
+		// This member's tracked items, with a per-token last-good cache: fresh within
+		// TOKEN_ITEMS_TTL_MS; on error, serve their own last-good set for up to
+		// TOKEN_ITEMS_STALE_MS, else nothing. Never the clan union.
+		let items = [];
 		if (supabaseConfigured(env)) {
-			try {
-				rows = await fetchTokenLootItems(env, token);
-			} catch (e) {
-				console.warn("[config] per-token items failed (using clan union):", e.message);
+			const ttl = Number(env.TOKEN_ITEMS_TTL_MS) || 60000;
+			const staleMs = Number(env.TOKEN_ITEMS_STALE_MS) || 1800000;
+			const cached = tokenItemsCache.get(token);
+			if (cached && Date.now() - cached.at < ttl) {
+				items = cached.items;
+			} else {
+				try {
+					items = (await fetchTokenLootItems(env, token)) || [];
+					tokenItemsCache.set(token, { at: Date.now(), items });
+				} catch (e) {
+					console.warn("[config] per-token items failed:", e.message);
+					items = cached && Date.now() - cached.at < staleMs ? cached.items : [];
+				}
 			}
 		}
-		const items = rows ?? (await getManifest(env)).items;
-		const names = items
-			.filter((i) => (i.match_type || "loot") === "loot")
-			.map((i) => (i.item_name || "").trim())
-			.filter(Boolean);
-		// Whatever the live config lists (split on newlines; may be a single mangled
-		// blob if the stored value lost its newlines — harmless, it just never matches).
+		// WATCH BOTH WAYS: inject ALL tracked item names, loot AND collection. A collection
+		// item in the loot allowlist is harmless (Dink only fires a loot notif if it actually
+		// drops as loot) and closes the "mis-tagged match_type → never tracked" gap — the
+		// site credits on whichever notification arrives first.
+		const names = items.map((i) => (i.item_name || "").trim()).filter(Boolean);
+		// Whatever the live config lists (split on newlines; may be a single mangled blob if
+		// the stored value lost its newlines — harmless, it just never matches).
 		const served =
 			typeof cfg.lootItemAllowlist === "string"
 				? cfg.lootItemAllowlist.split("\n").map((s) => s.trim()).filter(Boolean)
 				: [];
-		// Always rebuild the allowlist as: guaranteed bundled base ∪ live-config items ∪
-		// this member's injected tracked items — deduped case-insensitively, always
-		// correctly newline-separated. Sourcing the base from BASE_LOOT_ALLOWLIST means
-		// a mangled live value can't drop the permanent items; running unconditionally
-		// (not only when names.length) means the base is repaired even for a member with
-		// no active tiles.
+		// Rebuild the allowlist as: clan always-watch ∪ live-config items ∪ this member's
+		// tracked items — deduped case-insensitively, always correctly newline-separated.
+		// CLAN_ALWAYS_WATCH guarantees the marquee-drop feed set and repairs a mangled live
+		// value; it runs unconditionally so the base is correct even with no active tiles.
 		const seen = new Set();
 		const merged = [];
-		for (const n of [...BASE_LOOT_ALLOWLIST, ...served, ...names]) {
+		for (const n of [...CLAN_ALWAYS_WATCH, ...served, ...names]) {
 			const lc = n.toLowerCase();
 			if (!seen.has(lc)) {
 				seen.add(lc);

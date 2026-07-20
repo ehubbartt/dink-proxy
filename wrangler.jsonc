@@ -32,6 +32,11 @@
 		// site (bot_config row 'dink_config'); served here with the bundled JSON as
 		// fallback. Clients re-fetch /config periodically, so edits propagate within
 		// this TTL + the client's refetch interval — no redeploy needed.
-		"CONFIG_TTL_MS": "60000"
+		"CONFIG_TTL_MS": "60000",
+		// Per-token tracked-item cache. TTL is the fresh-refresh window; STALE is how long
+		// a member's OWN last-good item list may still be served if a vs_dink_token_items
+		// read fails (never the clan-wide union). After STALE with no success, serve none.
+		"TOKEN_ITEMS_TTL_MS": "60000",
+		"TOKEN_ITEMS_STALE_MS": "1800000"
 	}
 }
