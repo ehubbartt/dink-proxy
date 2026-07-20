@@ -8,6 +8,15 @@ const CHANNEL_TO_SECRET = {
 
 const SAFE_ALLOWED_MENTIONS = { parse: [] };
 
+// Notification types the proxy is willing to relay to Discord — a strict allowlist
+// (fail-closed): only messages of these types, which we format and expect, are
+// forwarded; every other type is silently dropped in handleHook. This is the trust
+// boundary that keeps external-plugin "send to Dink" notifications (e.g. a RuneLite
+// plugin's card-pack messages), chat triggers, level-ups, quests, and any unknown or
+// spoofed type out of the channels. LOOT and COLLECTION also feed the bingo/board
+// auto-tracker; DEATH and PET are forward-only.
+const FORWARD_TYPES = new Set(["LOOT", "COLLECTION", "DEATH", "PET"]);
+
 const CONFIG_TEMPLATE_STRING = JSON.stringify(dinkConfigTemplate);
 
 function getValidTokens (env) {
@@ -398,6 +407,17 @@ async function handleHook (request, env, ctx, channel) {
 		}
 	} else {
 		return new Response("unsupported content type", { status: 415 });
+	}
+
+	// Fail-closed trust boundary: only relay the notification types we format and
+	// fully understand (see FORWARD_TYPES). Anything else — external-plugin "send to
+	// Dink" notifications, chat triggers, levels, quests, unknown or spoofed types — is
+	// silently ignored and never reaches a channel. 204 so Dink treats it as delivered
+	// and doesn't retry. The console line is Worker-side only (observability), not a
+	// Discord message.
+	if (!FORWARD_TYPES.has(payload.type)) {
+		console.log("[hook] ignored unsupported type:", payload.type);
+		return new Response(null, { status: 204 });
 	}
 
 	payload.allowed_mentions = SAFE_ALLOWED_MENTIONS;
