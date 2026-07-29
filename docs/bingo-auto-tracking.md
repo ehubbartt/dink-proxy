@@ -123,6 +123,16 @@ essentially every drop. Config is served per-token by the Worker
   manifest's participant set and the item (`id` and/or normalized `name`) against the manifest's tile
   item set. On a match, record a drop (below). Optionally also require `extra.source` to match the
   tile's `source_name`.
+- **Decision B′ — value match (Battleship).** Decision B is item-driven, and the site's Battleship
+  event scores drops by **value** with the item irrelevant, so no allowlist can express "any drop
+  over 5m". The manifest therefore also carries `valueFloors`, loaded from the site's
+  `vs_value_tracked_rsns` view (rsn → gp floor, emitted only while that player's event is `open` and
+  in its `battle` phase). A loot stack is recorded when Decision B matches **or** the dropper has a
+  floor and that single stack clears it — per stack, never the summed total, matching Decision A's
+  rule so a dump of cheap stacks can't add up. The floor also admits the dropper at the participant
+  check, since a Battleship player has no tracked items of their own. A missing or erroring view
+  degrades to "nobody is value-tracked", so this can never break the bingo path. See the site's
+  `docs/BATTLESHIP.md`.
 - Use `ctx.waitUntil(...)` for the ingestion write so we ack Dink fast and don't block on Supabase.
   (Add `ctx` to the `fetch(request, env, ctx)` signature — [src/index.js:83](../src/index.js#L83).)
 
