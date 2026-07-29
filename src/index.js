@@ -124,30 +124,51 @@ async function getManifest (env) {
 		return manifestCache.data;
 	}
 	if (!supabaseConfigured(env)) {
-		const empty = { participants: new Set(), items: [] };
+		const empty = { participants: new Set(), items: [], valueFloors: new Map() };
 		manifestCache = { at: Date.now(), data: empty };
 		return empty;
 	}
 	try {
-		const [participants, items] = await Promise.all([
+		const [participants, items, valueTracked] = await Promise.all([
 			sbGet(env, "vs_active_participants", "rsn"),
 			// The site's vs_active_tracked_items view (derived from vs_active_player_tiles)
 			// exposes only these columns — a flat, event-less list of trackable items.
 			sbGet(env, "vs_active_tracked_items", "item_id,item_name,match_type"),
+			// Battleship scores drops by VALUE, so no item allowlist can express what it
+			// needs ("any drop over 5m"). This view names the members in a live battle and
+			// the gp floor to apply to them. Failure here must not sink the manifest, so
+			// it degrades to "nobody is value-tracked" rather than throwing.
+			sbGet(env, "vs_value_tracked_rsns", "rsn,min_value").catch((e) => {
+				console.warn("[manifest] value-tracked load failed:", e.message);
+				return [];
+			}),
 		]);
 		const data = {
 			participants: new Set(
 				(participants || []).map((r) => String(r.rsn || "").toLowerCase()),
 			),
 			items: items || [],
+			valueFloors: new Map(
+				(valueTracked || [])
+					.filter((r) => r && r.rsn)
+					.map((r) => [String(r.rsn).toLowerCase(), Number(r.min_value) || 0]),
+			),
 		};
 		manifestCache = { at: Date.now(), data };
 		return data;
 	} catch (e) {
 		console.warn("[manifest] load failed:", e.message);
 		// Serve the stale cache if we have one; otherwise an empty manifest.
-		return manifestCache.data || { participants: new Set(), items: [] };
+		return manifestCache.data || { participants: new Set(), items: [], valueFloors: new Map() };
 	}
+}
+
+// The gp floor above which THIS player's drops are recorded regardless of item, or null
+// when they aren't in a live Battleship event. This is the only value-based recording
+// path; every other tracker is item-driven.
+function valueFloorFor (manifest, rsn) {
+	const floor = manifest.valueFloors?.get(String(rsn || "").toLowerCase());
+	return typeof floor === "number" ? floor : null;
 }
 
 // Stable idempotency key so Dink's retries (maxRetries: 3) don't double-insert.
@@ -230,14 +251,20 @@ async function insertDinkDrops (env, rows) {
 	}
 }
 
-// Decision B (LOOT): record any looted item that belongs to the active tracked-item set
-// (any match_type — watch both ways) AND was dropped by a known participant. If the client
-// attached a screenshot, it's uploaded once and stamped on every matched row from this kill
-// — the site copies it into the credited tile's proof images.
+// Decision B (LOOT): record a looted item when EITHER
+//   - it belongs to the active tracked-item set (any match_type — watch both ways) and the
+//     dropper is a known participant: the bingo / personal-board path; or
+//   - the dropper is in a live Battleship battle and the STACK clears their gp floor: the
+//     value path, where the item is irrelevant and only the number matters.
+// If the client attached a screenshot, it's uploaded once and stamped on every matched row
+// from this kill — the site copies it into the credited tile's proof images.
 async function ingestLootMatches (env, payload, manifest, screenshot) {
 	if (!supabaseConfigured(env)) return;
 	const rsn = String(payload.playerName || "");
-	if (!rsn || !manifest.participants.has(rsn.toLowerCase())) return;
+	const valueFloor = valueFloorFor(manifest, rsn);
+	// A Battleship player is a participant by virtue of being in the battle, even with no
+	// tracked item to their name — so the value floor also admits them at the door.
+	if (!rsn || (!manifest.participants.has(rsn.toLowerCase()) && valueFloor == null)) return;
 
 	const items = payload?.extra?.items;
 	if (!Array.isArray(items) || items.length === 0) return;
@@ -247,9 +274,13 @@ async function ingestLootMatches (env, payload, manifest, screenshot) {
 
 	const rows = [];
 	for (const item of items) {
-		if (!findTrackedMatch(manifest, { id: item.id, name: item.name })) continue;
 		const qty = Number(item.quantity) || 1;
 		const value = (Number(item.priceEach) || 0) * qty;
+		// Record if the item is tracked (bingo/personal boards) OR the STACK clears this
+		// player's Battleship floor. Per-stack, never the summed total — same rule the
+		// Discord feed uses, so a herb-run dump of cheap stacks can't add up to a bomb.
+		const tracked = !!findTrackedMatch(manifest, { id: item.id, name: item.name });
+		if (!tracked && !(valueFloor != null && value >= valueFloor)) continue;
 		const key = await dropKey([rsn, item.id ?? item.name, source ?? "", dinkTs, qty]);
 		// No event_id — the consumer resolves the tile(s) per user from the active index.
 		rows.push({
