@@ -37,9 +37,10 @@ jobs:
             echo "::error::CLOUDFLARE_API_TOKEN repo secret is not set. Add it in Settings → Secrets → Actions, then re-run."
             exit 1
           fi
-      # A clean install on the runner's own platform — the exact thing that was wrong
-      # locally. No lockfile is committed, so `npm install` rather than `npm ci`.
-      - run: npm install
+      # A clean install on the runner's OWN platform, which is precisely what was wrong
+      # locally: the lockfile carries every platform's optional workerd binary, and npm
+      # picks the right one per host. `npm ci` so the deploy matches the lockfile exactly.
+      - run: npm ci
       - name: Deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
