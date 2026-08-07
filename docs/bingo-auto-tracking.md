@@ -278,6 +278,32 @@ processed     boolean default false
 
 ---
 
+## Testing the worker without deploying
+
+`scripts/send-test-drop.mjs` posts a fake LOOT payload through the **real** worker
+`fetch` handler in-process, against whatever Supabase the shell points at:
+
+```bash
+SUPABASE_URL=… SUPABASE_SERVICE_ROLE_KEY=… \
+  node scripts/send-test-drop.mjs --token <t> --rsn bajj --value 60000000
+```
+
+It covers token validation, the manifest load (including `vs_value_tracked_rsns`) and
+the admission rule — the part no other test in either repo reaches, and the one that
+decides whether a Battleship drop becomes a bomb. **Point it at staging**: it writes a
+real `vs_dink_drops` row for that RSN, and against a database with a live battle that row
+arms a real bomb.
+
+What it does not cover is Cloudflare itself — routing, secrets, and whether the deployed
+bundle is the code you just tested. A green run means the code is right, not that it is
+live.
+
+Verified this way against staging with a member in a live battle: 60m → Broadside (tier 3),
+30m → Bombard (tier 2), 8m → Cannonball (tier 1), and 4m recorded but stamped `no_tile`
+with no bomb minted.
+
+---
+
 ## References
 
 dink-proxy: [src/index.js](../src/index.js) · [dinkconfig-template.json](../dinkconfig-template.json) ·
