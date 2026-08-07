@@ -172,6 +172,31 @@ function valueFloorFor (manifest, rsn) {
 }
 
 // Stable idempotency key so Dink's retries (maxRetries: 3) don't double-insert.
+// The timestamp that goes INTO drop_key, and therefore decides what counts as the same
+// drop. It must be identical across repeat deliveries of one drop.
+//
+// Dink can post the same notification more than once — the served config points
+// `lootWebhook` and `discordWebhook` at the same URL, so a loot notification arrives
+// twice. The old fallback stamped each delivery with `new Date()`, so the two hashed
+// differently, `on_conflict=drop_key` did not collapse them, and two rows landed.
+//
+// That was invisible for years because the consumer credits a bingo TILE, and crediting
+// a tile twice is a no-op. Battleship mints a BOMB per drop_key, so the same duplication
+// silently handed every player two bombs per drop.
+//
+// The embed timestamp is used whenever Dink sends one (stable, and distinct per real
+// drop). Without it, the receipt time is floored to a window so near-simultaneous
+// deliveries land on the same value. Two GENUINE identical drops (same player, item,
+// source and quantity) inside one window would collapse to a single bomb — rare at these
+// values, and far cheaper than doubling everyone's ammunition.
+const DUP_WINDOW_MS = 60_000;
+
+function stableTimestamp (payload) {
+	const embedTs = payload?.embeds?.[0]?.timestamp;
+	if (embedTs) return embedTs;
+	return new Date(Math.floor(Date.now() / DUP_WINDOW_MS) * DUP_WINDOW_MS).toISOString();
+}
+
 async function dropKey (parts) {
 	const enc = new TextEncoder().encode(parts.join("|"));
 	const buf = await crypto.subtle.digest("SHA-256", enc);
@@ -270,7 +295,7 @@ async function ingestLootMatches (env, payload, manifest, screenshot) {
 	if (!Array.isArray(items) || items.length === 0) return;
 
 	const source = payload?.extra?.source ?? null;
-	const dinkTs = payload?.embeds?.[0]?.timestamp ?? new Date().toISOString();
+	const dinkTs = stableTimestamp(payload);
 
 	const rows = [];
 	for (const item of items) {
@@ -319,7 +344,7 @@ async function ingestCollectionMatch (env, payload, manifest, screenshot) {
 
 	if (!findTrackedMatch(manifest, { id: itemId, name: itemName })) return;
 
-	const dinkTs = payload?.embeds?.[0]?.timestamp ?? new Date().toISOString();
+	const dinkTs = stableTimestamp(payload);
 	const value = Number(ex.price) || 0;
 	const key = await dropKey([rsn, itemId ?? itemName, "collection", dinkTs, 1]);
 	const imageUrl = screenshot ? await uploadDropImage(env, key, screenshot) : null;

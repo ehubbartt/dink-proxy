@@ -278,6 +278,30 @@ processed     boolean default false
 
 ---
 
+## Duplicate deliveries
+
+The served config points **both** `lootWebhook` and `discordWebhook` at
+`/hook/{token}/achievements`, so Dink posts every loot notification twice. `drop_key`
+therefore has to hash identically across both deliveries, and `stableTimestamp()` is what
+guarantees that: the embed timestamp when Dink sends one, otherwise receipt time floored
+to a 60-second window.
+
+It used to fall back to a bare `new Date()`, so the two deliveries hashed differently,
+`on_conflict=drop_key` did not collapse them, and two rows landed. **That went unnoticed
+for as long as the consumer only credited bingo tiles** — crediting a tile twice is a
+no-op. Battleship mints a bomb per `drop_key`, so the same old duplication started handing
+every player two bombs per drop the moment the first event went live.
+
+The cost of the window: two GENUINE identical drops (same player, item, source and
+quantity) inside 60 seconds collapse to one. Rare at Battleship values, and far cheaper
+than doubling everyone's ammunition.
+
+The real cure is the config — one webhook should handle loot, not two. That is deliberately
+not done here: Dink only reloads config when a member re-imports their URL, so changing it
+does nothing for an event already running.
+
+---
+
 ## Testing the worker without deploying
 
 `scripts/send-test-drop.mjs` posts a fake LOOT payload through the **real** worker
