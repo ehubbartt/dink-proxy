@@ -54,5 +54,41 @@
 		// read fails (never the clan-wide union). After STALE with no success, serve none.
 		"TOKEN_ITEMS_TTL_MS": "60000",
 		"TOKEN_ITEMS_STALE_MS": "1800000"
+	},
+
+	// ── The STAGING worker ────────────────────────────────────────────────────
+	// `npx wrangler deploy --env staging` deploys a SEPARATE worker named
+	// dink-proxy-staging, pointed at the staging Supabase and the staging site, so
+	// whole events can be rehearsed end-to-end — manufactured drops in, pieces on
+	// the board out — without touching production data. Real Dink clients keep
+	// using the prod worker; point a test client's config URL at this one to
+	// rehearse with live RuneLite too.
+	//
+	// Wrangler environments inherit NOTHING bindable: vars and secrets are
+	// per-environment, so the full set is repeated here and the secrets need
+	// setting once with --env staging:
+	//
+	//   npx wrangler secret put SUPABASE_KEY --env staging          # staging service-role key
+	//   npx wrangler secret put DINK_PROCESS_SECRET --env staging   # staging site's value
+	//
+	// WEBHOOK_* secrets are deliberately NOT set on staging — a rehearsal must
+	// never post to the clan's real Discord channels. The Discord forward simply
+	// fails quietly (it runs after the Supabase write, under waitUntil).
+	"env": {
+		"staging": {
+			"triggers": {
+				"crons": ["* * * * *", "*/15 * * * *"]
+			},
+			"vars": {
+				"FEED_MIN_VALUE": "3000000",
+				"SUPABASE_URL": "https://rvkrlyxdiqqlknvcbhcu.supabase.co",
+				"SITE_URL": "https://volition-site-staging.fly.dev",
+				"MANIFEST_TTL_MS": "5000",
+				"TOKENS_TTL_MS": "5000",
+				"CONFIG_TTL_MS": "60000",
+				"TOKEN_ITEMS_TTL_MS": "5000",
+				"TOKEN_ITEMS_STALE_MS": "1800000"
+			}
+		}
 	}
 }
