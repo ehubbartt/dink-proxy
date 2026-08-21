@@ -11,6 +11,11 @@ and admins approving them by hand.
 > the site's `processDinkDrops` credits tiles. Current behaviour that differs from the
 > proposal below:
 >
+> - **After-insert drain ping + cron backstop**: after rows land, the worker POSTs the
+>   site's `/api/dink/process?reconcile=0` so crediting is event-driven (~seconds), and two
+>   cron triggers bound the worst case — every minute a plain drain, every 15 minutes a
+>   drain with the reconcile pass. Both no-op until `SITE_URL` (wrangler.jsonc) and the
+>   `DINK_PROCESS_SECRET` secret are set; see the site's `docs/LIVE-UPDATES.md`.
 > - **Allowlist injection** (`handleConfig`) injects **every** tracked item name for the token
 >   (loot- and collection-tagged alike — "watch both ways"), so a mis-tagged item can't be
 >   kept out of the allowlist.

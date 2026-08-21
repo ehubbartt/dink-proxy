@@ -225,8 +225,34 @@ async function uploadDropImage (env, key, screenshot) {
 	}
 }
 
+// Nudge the site to drain vs_dink_drops NOW (POST /api/dink/process — see the site's
+// docs/LIVE-UPDATES.md). The after-insert ping goes drain-only (reconcile=false); the
+// 15-minute cron passes reconcile=true so the healing pass for recent un-credited drops
+// stays on a schedule instead of running per kill. Best-effort: a lost ping just means
+// the drop waits for the next cron (≤60s). No-op until SITE_URL + DINK_PROCESS_SECRET
+// are configured.
+async function pingSiteDrain (env, reconcile = false) {
+	if (!env.SITE_URL || !env.DINK_PROCESS_SECRET) return;
+	const base = env.SITE_URL.replace(/\/+$/, "");
+	try {
+		const res = await fetch(`${base}/api/dink/process?reconcile=${reconcile ? 1 : 0}`, {
+			method: "POST",
+			headers: { Authorization: `Bearer ${env.DINK_PROCESS_SECRET}` },
+			signal: AbortSignal.timeout(10_000),
+		});
+		if (!res.ok) {
+			console.warn("[drain] site responded", res.status, await res.text().catch(() => ""));
+		}
+	} catch (e) {
+		console.warn("[drain] ping failed:", e.message);
+	}
+}
+
 // Insert matched drop rows into vs_dink_drops (dedup via drop_key). Best-effort:
-// failures are logged, never thrown.
+// failures are logged, never thrown. After rows land, the site is pinged to drain the
+// queue immediately — callers already run under ctx.waitUntil, so awaiting the ping here
+// never delays Dink's response (and on Fly's suspend autostop, the ping also WAKES a
+// suspended site machine).
 async function insertDinkDrops (env, rows) {
 	if (rows.length === 0) return;
 	try {
@@ -245,7 +271,9 @@ async function insertDinkDrops (env, rows) {
 		);
 		if (!res.ok) {
 			console.warn("[ingest] insert failed:", res.status, await res.text().catch(() => ""));
+			return;
 		}
+		await pingSiteDrain(env);
 	} catch (e) {
 		console.warn("[ingest] insert error:", e.message);
 	}
@@ -717,5 +745,12 @@ export default {
 		}
 
 		return new Response("not found", { status: 404 });
+	},
+
+	// Cron backstop (schedules in wrangler.jsonc "triggers"): the every-minute cron is a
+	// plain drain — it bounds worst-case credit latency even when an after-insert ping was
+	// lost — and the 15-minute cron drains WITH the reconcile pass.
+	async scheduled (event, env, ctx) {
+		ctx.waitUntil(pingSiteDrain(env, event.cron === "*/15 * * * *"));
 	},
 };

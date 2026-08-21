@@ -10,6 +10,15 @@
 	"observability": {
 		"enabled": true
 	},
+	// Drain backstop for vs_dink_drops (see the site's docs/LIVE-UPDATES.md): every minute
+	// a plain drain bounds worst-case credit latency at ~60s even if an after-insert ping
+	// was lost; every 15 minutes the drain also reconciles recent un-credited drops whose
+	// situation may have changed (e.g. a player who signed up after their drop). The
+	// scheduled handler branches on which cron fired. No-ops until SITE_URL and the
+	// DINK_PROCESS_SECRET secret are configured.
+	"triggers": {
+		"crons": ["* * * * *", "*/15 * * * *"]
+	},
 	// Non-secret config. Set SUPABASE_KEY (service-role or anon w/ insert RLS) as a
 	// SECRET via `npx wrangler secret put SUPABASE_KEY` — never commit it here.
 	// VALID_TOKENS and WEBHOOK_* are also secrets managed by the bot / by hand.
@@ -22,6 +31,13 @@
 		// Supabase REST base, e.g. https://<project>.supabase.co . Leave blank to
 		// disable auto-tracking (the proxy then behaves exactly as before).
 		"SUPABASE_URL": "https://rrnmckaabbvtkkpoeefg.supabase.co",
+		// The site that drains vs_dink_drops — its CANONICAL origin (an off-canonical host
+		// would 308 the drain ping). Used by the after-insert ping and the cron backstop;
+		// leave blank to disable both (drops then wait for the site's poll-on-read
+		// backstop, exactly the pre-pipeline behaviour). Requires the DINK_PROCESS_SECRET
+		// secret: `npx wrangler secret put DINK_PROCESS_SECRET` — same value as the Fly
+		// app's DINK_PROCESS_SECRET.
+		"SITE_URL": "",
 		// Manifest cache TTL (ms) in the isolate global.
 		"MANIFEST_TTL_MS": "30000",
 		// Per-user token cache TTL (ms). Tokens are minted/revoked in the dink_tokens
