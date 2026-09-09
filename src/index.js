@@ -50,10 +50,10 @@ function getValidTokens (env) {
 //   2. the legacy VALID_TOKENS secret (kept as a fallback / for the bot's syncWorker).
 // The Supabase set is cached in an isolate global with a short TTL so a freshly
 // minted or revoked token takes effect within ~TTL without a redeploy.
-let tokensCache = { at: 0, set: null, multi: new Set() };
+let tokensCache = { at: 0, set: null, multi: new Set(), meta: new Map() };
 
 async function fetchDinkTokens (env) {
-	const url = `${env.SUPABASE_URL}/rest/v1/dink_tokens?select=token,multi_server&revoked_at=is.null`;
+	const url = `${env.SUPABASE_URL}/rest/v1/dink_tokens?select=token,discord_id,multi_server,mode,forward_clan&revoked_at=is.null`;
 	const res = await fetch(url, {
 		headers: {
 			apikey: env.SUPABASE_KEY,
@@ -76,21 +76,51 @@ async function getValidTokenSet (env) {
 				at: Date.now(),
 				set: new Set(rows.map((r) => r.token)),
 				multi: new Set(rows.filter((r) => r.multi_server === true).map((r) => r.token)),
+				// mode + forward_clan + owner, for the config variant and the two
+				// forwarding decisions. Falls back to the legacy boolean for a row
+				// written before those columns existed.
+				meta: new Map(
+					rows.map((r) => [
+						r.token,
+						{
+							mode: MODES.has(r.mode) ? r.mode : r.multi_server === true ? "multi_server" : "standard",
+							forwardClan: r.forward_clan !== false,
+							discordId: r.discord_id || null,
+						},
+					]),
+				),
 			};
 		} catch (e) {
 			console.warn("[tokens] load failed:", e.message);
-			if (!tokensCache.set) tokensCache = { at: Date.now(), set: new Set(), multi: new Set() };
+			if (!tokensCache.set) {
+				tokensCache = { at: Date.now(), set: new Set(), multi: new Set(), meta: new Map() };
+			}
 		}
 	}
 	for (const t of tokensCache.set) set.add(t);
 	return set;
 }
 
-// Was this token flagged multi-server (dink_tokens.multi_server, set from the
-// site's /dink-check page)? Reads the cache getValidTokenSet just refreshed —
-// legacy VALID_TOKENS entries are never multi-server.
+// Delivery shapes, set from the site's /dink-check wizard. See the site's
+// db/scripts/dink_modes_and_relays.sql for what each one means.
+const MODES = new Set(["standard", "multi_server", "relay"]);
+
+// What we know about a token. A legacy VALID_TOKENS entry has no row, so it gets the
+// historical behaviour: standard config, forwards to the clan Discord.
+function tokenMeta (token) {
+	return (
+		tokensCache.meta.get(token) || {
+			mode: tokensCache.multi.has(token) ? "multi_server" : "standard",
+			forwardClan: true,
+			discordId: null,
+		}
+	);
+}
+
+// Was this token flagged multi-server? Reads the cache getValidTokenSet just
+// refreshed — legacy VALID_TOKENS entries are never multi-server.
 function isMultiServerToken (token) {
-	return tokensCache.multi.has(token);
+	return tokenMeta(token).mode === "multi_server";
 }
 
 // ── Active manifest (cached in the isolate global) ───────────────────────────
@@ -419,7 +449,84 @@ function trimLootMessage (payload, threshold) {
 	});
 }
 
-async function handleHook (request, env, ctx, channel) {
+// ── Member-owned relay destinations ──────────────────────────────────────────
+// A member on `relay` mode keeps their own Discord servers OUT of Dink and registers
+// those channels with us instead (site: vs_dink_relays). We post on their behalf,
+// applying each destination's own value floor and notification set — which is what
+// lets them keep minLootValue 1 for tracking without drowning their other servers.
+//
+// Webhook URLs are secrets: they are never logged, not even on failure.
+let relaysCache = new Map(); // discordId → { at:number, rows:[] }
+
+async function fetchRelays (env, discordId) {
+	const url =
+		`${env.SUPABASE_URL}/rest/v1/vs_dink_relays` +
+		`?select=url,min_value,types&enabled=is.true&discord_id=eq.${encodeURIComponent(discordId)}`;
+	const res = await fetch(url, {
+		headers: { apikey: env.SUPABASE_KEY, Authorization: `Bearer ${env.SUPABASE_KEY}` },
+	});
+	if (!res.ok) throw new Error(`vs_dink_relays ${res.status}`);
+	return res.json();
+}
+
+async function getRelays (env, discordId) {
+	if (!supabaseConfigured(env) || !discordId) return [];
+	const ttl = Number(env.RELAYS_TTL_MS) || 60000;
+	const hit = relaysCache.get(discordId);
+	if (hit && Date.now() - hit.at < ttl) return hit.rows;
+	try {
+		const rows = (await fetchRelays(env, discordId)) || [];
+		relaysCache.set(discordId, { at: Date.now(), rows });
+		return rows;
+	} catch (e) {
+		console.warn("[relay] load failed:", e.message);
+		return hit ? hit.rows : [];
+	}
+}
+
+// Dink's embeds point at the screenshot with attachment:// URLs. We relay JSON only
+// (reusing one multipart body across several fetches is a footgun), so those
+// references would render as broken images — drop them.
+function stripAttachmentRefs (payload) {
+	for (const e of payload?.embeds || []) {
+		if (typeof e?.image?.url === "string" && e.image.url.startsWith("attachment://")) delete e.image;
+		if (typeof e?.thumbnail?.url === "string" && e.thumbnail.url.startsWith("attachment://")) {
+			delete e.thumbnail;
+		}
+	}
+	return payload;
+}
+
+async function fanOutToRelays (env, discordId, payload) {
+	const relays = await getRelays(env, discordId);
+	for (const r of relays) {
+		const types = Array.isArray(r.types) ? r.types : [];
+		if (!types.includes(payload.type)) continue;
+
+		// Each destination judges value for itself, per stack, exactly like the clan feed.
+		const body = stripAttachmentRefs(JSON.parse(JSON.stringify(payload)));
+		if (payload.type === "LOOT") {
+			const floor = Number(r.min_value) || 0;
+			if (feedWorthyStacks(body, floor).length === 0) continue;
+			trimLootMessage(body, floor);
+		}
+		body.allowed_mentions = SAFE_ALLOWED_MENTIONS;
+
+		try {
+			const res = await fetch(r.url, {
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			});
+			// Status only — never the URL, which would put a live webhook in the logs.
+			if (!res.ok) console.warn("[relay] destination returned", res.status);
+		} catch (e) {
+			console.warn("[relay] post failed:", e.message);
+		}
+	}
+}
+
+async function handleHook (request, env, ctx, channel, token) {
 	const secretName = CHANNEL_TO_SECRET[channel];
 	const webhook = secretName && env[secretName];
 	if (!webhook) {
@@ -499,6 +606,16 @@ async function handleHook (request, env, ctx, channel) {
 	// (A) only forward to Discord when a SINGLE STACK clears FEED_MIN_VALUE — the
 	// summed total is never used, so cheap tracked items and multi-stack junk
 	// dumps are recorded but don't spam the achievements channel.
+	// Who this token belongs to, and how they asked to be wired.
+	const meta = tokenMeta(token);
+
+	// Decision C — the member's OWN servers, if they asked us to post for them. Runs
+	// on the UNTRIMMED payload and before the clan-feed trim below, because a
+	// destination's floor is its own business and may be lower than ours.
+	if (meta.mode === "relay" && meta.discordId) {
+		ctx.waitUntil(fanOutToRelays(env, meta.discordId, JSON.parse(JSON.stringify(payload))));
+	}
+
 	if (payload.type === "LOOT") {
 		const manifest = await getManifest(env);
 		// Decision B — ack Dink fast; do the DB write in the background. (Runs on
@@ -519,6 +636,13 @@ async function handleHook (request, env, ctx, channel) {
 		// the background; the notification still forwards to its channel as before.
 		const manifest = await getManifest(env);
 		ctx.waitUntil(ingestCollectionMatch(env, payload, manifest, screenshot));
+	}
+
+	// A visiting clan's player is TRACKED but never FED: their drops credit event
+	// tiles (decision B above already ran) and their own servers get whatever they
+	// registered (decision C), but nothing of theirs appears in the Volition Discord.
+	if (!meta.forwardClan) {
+		return new Response(null, { status: 204 });
 	}
 
 	// Forward to Discord (unchanged behaviour for everything that reaches here).
@@ -713,7 +837,7 @@ export default {
 			if (!validTokens.has(token)) {
 				return new Response("unauthorized", { status: 401 });
 			}
-			return handleHook(request, env, ctx, channel);
+			return handleHook(request, env, ctx, channel, token);
 		}
 
 		return new Response("not found", { status: 404 });
