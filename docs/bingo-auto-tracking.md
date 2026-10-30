@@ -75,6 +75,9 @@ RuneLite + Dink (minLootValue lowered)
 │        → record drop to ingestion sink (Supabase)                 │
 │     else → drop                                                   │
 └─────────────────────────────────────────────────────────────────┘
+  playerName is compared with `rsnKey()`: lowercased, with any run of space / hyphen /
+  underscore folded to one space. OSRS treats those as the same character, and Dink sends
+  the real spelling ("Chest X-Ray") while the roster comes from WiseOldMan ("Chest X Ray").
       │ (matched drops only)
       ▼
   Supabase  dink_drops  (raw, deduped, audit log)

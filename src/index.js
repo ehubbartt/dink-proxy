@@ -145,13 +145,13 @@ async function getManifest (env) {
 		]);
 		const data = {
 			participants: new Set(
-				(participants || []).map((r) => String(r.rsn || "").toLowerCase()),
+				(participants || []).map((r) => rsnKey(r.rsn)),
 			),
 			items: items || [],
 			valueFloors: new Map(
 				(valueTracked || [])
 					.filter((r) => r && r.rsn)
-					.map((r) => [String(r.rsn).toLowerCase(), Number(r.min_value) || 0]),
+					.map((r) => [rsnKey(r.rsn), Number(r.min_value) || 0]),
 			),
 		};
 		manifestCache = { at: Date.now(), data };
@@ -163,11 +163,20 @@ async function getManifest (env) {
 	}
 }
 
+// One comparison key per player name. OSRS treats space, hyphen and underscore in a name as
+// the same character, and the sources disagree on which they use: Dink sends the real
+// in-game spelling ("Chest X-Ray") while the clan roster comes from WiseOldMan, which folds
+// hyphens into spaces ("Chest X Ray"). Comparing raw lowercase names dropped that member's
+// every drop at the door. The stored rsn stays exactly what Dink sent.
+function rsnKey (rsn) {
+	return String(rsn || "").toLowerCase().replace(/[\s_-]+/g, " ").trim();
+}
+
 // The gp floor above which THIS player's drops are recorded regardless of item, or null
 // when they aren't in a live Battleship event. This is the only value-based recording
 // path; every other tracker is item-driven.
 function valueFloorFor (manifest, rsn) {
-	const floor = manifest.valueFloors?.get(String(rsn || "").toLowerCase());
+	const floor = manifest.valueFloors?.get(rsnKey(rsn));
 	return typeof floor === "number" ? floor : null;
 }
 
@@ -264,7 +273,7 @@ async function ingestLootMatches (env, payload, manifest, screenshot) {
 	const valueFloor = valueFloorFor(manifest, rsn);
 	// A Battleship player is a participant by virtue of being in the battle, even with no
 	// tracked item to their name — so the value floor also admits them at the door.
-	if (!rsn || (!manifest.participants.has(rsn.toLowerCase()) && valueFloor == null)) return;
+	if (!rsn || (!manifest.participants.has(rsnKey(rsn)) && valueFloor == null)) return;
 
 	const items = payload?.extra?.items;
 	if (!Array.isArray(items) || items.length === 0) return;
@@ -310,7 +319,7 @@ async function ingestLootMatches (env, payload, manifest, screenshot) {
 async function ingestCollectionMatch (env, payload, manifest, screenshot) {
 	if (!supabaseConfigured(env)) return;
 	const rsn = String(payload.playerName || "");
-	if (!rsn || !manifest.participants.has(rsn.toLowerCase())) return;
+	if (!rsn || !manifest.participants.has(rsnKey(rsn))) return;
 
 	const ex = payload?.extra || {};
 	const itemId = ex.itemId ?? null;
@@ -461,8 +470,8 @@ async function handleHook (request, env, ctx, channel) {
 	// account sends — every type, including ones dropped below — without the whole clan's
 	// traffic in the logs. Worker-side only (view with `wrangler tail` or the dashboard Logs);
 	// never forwarded to Discord. Unset the secret to turn it off.
-	const debugRsn = (env.DEBUG_LOG_RSN || "").trim().toLowerCase();
-	if (debugRsn && String(payload.playerName || "").toLowerCase() === debugRsn) {
+	const debugRsn = rsnKey(env.DEBUG_LOG_RSN);
+	if (debugRsn && rsnKey(payload.playerName) === debugRsn) {
 		console.log("[debug]", channel, JSON.stringify(payload));
 	}
 
